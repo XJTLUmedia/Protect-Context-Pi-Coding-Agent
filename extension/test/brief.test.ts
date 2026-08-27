@@ -1,0 +1,127 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { buildBrief, sha1Hex, BRIEF_MAX_CORRECTIONS, BRIEF_MAX_LOOPS } from "../lib/brief.ts";
+import { DEFAULT_CONTRACT } from "../lib/defaults.ts";
+
+test("brief: digest is stable and hex sha1", () => {
+  const input = {
+    contract: DEFAULT_CONTRACT.constraints,
+    corrections: [],
+    loops: [],
+    lastEvidence: null,
+  };
+  const d1 = sha1Hex(buildBrief(input));
+  const d2 = sha1Hex(buildBrief({ ...input, contract: [...DEFAULT_CONTRACT.constraints] }));
+  assert.equal(d1, d2);
+  assert.match(d1, /^[0-9a-f]{40}$/);
+});
+
+test("brief: digest changes when content changes", () => {
+  const d1 = sha1Hex(buildBrief({ contract: DEFAULT_CONTRACT.constraints, corrections: [], loops: [], lastEvidence: null }));
+  const d2 = sha1Hex(
+    buildBrief({
+      contract: DEFAULT_CONTRACT.constraints,
+      corrections: [{ type: "correction", text: "use pnpm", tags: ["tools"] }],
+      loops: [],
+      lastEvidence: null,
+    }),
+  );
+  assert.notEqual(d1, d2);
+});
+
+test("brief: contract capped at 12 lines, includes ids and texts", () => {
+  const brief = buildBrief({ contract: DEFAULT_CONTRACT.constraints, corrections: [], loops: [], lastEvidence: null });
+  const lines = brief.split("\n");
+  // 1 header + 12 constraints
+  assert.equal(lines.filter((l) => l.startsWith("0") || l.startsWith("1")).length, 12);
+  assert.ok(lines.some((l) => l.startsWith("01-obey-instructions:")));
+  assert.ok(lines.some((l) => l.startsWith("12-budget-context:")));
+});
+
+test("brief: free-text lines are capped (model text cannot bloat the brief)", () => {
+  const long = "x".repeat(500);
+  const brief = buildBrief({
+    contract: DEFAULT_CONTRACT.constraints,
+    corrections: [{ type: "correction", text: long, tags: [] }],
+    loops: [{ cmd: long, failures: 2, lastExit: 1 }],
+    lastEvidence: { id: "ev-0001", exit: 1, cmd: long, ms: 10 },
+  });
+  for (const line of brief.split("\n")) {
+    // dynamic text ≤ 200 chars; fixed prefixes (e.g. "last verify: ev-0001 exit=1 '") add ≤ ~40
+    assert.ok(line.length <= 240, `line too long (${line.length})`);
+  }
+  assert.ok(brief.includes("…"), "truncation marker present");
+  // multi-line model text collapses to a single brief line
+  const brief2 = buildBrief({
+    contract: DEFAULT_CONTRACT.constraints,
+    corrections: [{ type: "correction", text: "line one\nline two", tags: [] }],
+    loops: [],
+    lastEvidence: null,
+  });
+  assert.ok(brief2.includes("line one line two"));
+});
+
+test("brief: includes at most 3 corrections and 2 loops and last evidence", () => {
+  const corrections = Array.from({ length: 5 }, (_, i) => ({
+    type: "correction",
+    text: `correction ${i}`,
+    tags: [`t${i}`],
+  })).reverse(); // newest first, as journal.recentCorrections produces
+  const loops = [
+    { cmd: "loop-a", failures: 3, lastExit: 1 },
+    { cmd: "loop-b", failures: 2, lastExit: 2 },
+    { cmd: "loop-c", failures: 2, lastExit: 3 },
+  ];
+  const brief = buildBrief({
+    contract: DEFAULT_CONTRACT.constraints,
+    corrections,
+    loops,
+    lastEvidence: { id: "ev-0007", exit: 0, cmd: "npm test", ms: 1200 },
+  });
+  const lines = brief.split("\n");
+  const corrLines = lines.filter((l) => l.startsWith("- correction "));
+  assert.equal(corrLines.length, BRIEF_MAX_CORRECTIONS);
+  assert.ok(corrLines.some((l) => l.includes("correction 4")), "newest corrections kept");
+  const loopLines = lines.filter((l) => l.startsWith("- '"));
+  assert.equal(loopLines.length, BRIEF_MAX_LOOPS);
+  assert.ok(lines.some((l) => l.includes("ev-0007") && l.includes("exit=0")));
+  assert.ok(lines.some((l) => l.includes("[t4]")));
+});
+
+test("brief: constraints beyond the 12-line cap get an overflow marker", () => {
+  const extra = Array.from({ length: 3 }, (_, i) => ({
+    id: `13-extra-${i}`,
+    text: `extra constraint ${i}`,
+    added: "2026-08-28",
+    source: "agent",
+  }));
+  const brief = buildBrief({
+    contract: [...DEFAULT_CONTRACT.constraints, ...extra],
+    corrections: [],
+    loops: [],
+    lastEvidence: null,
+  });
+  const lines = brief.split("\n");
+  assert.equal(lines.filter((l) => l.startsWith("0") || l.startsWith("1")).length, 12);
+  assert.ok(lines.some((l) => l.startsWith("+3 more constraints hidden")), "overflow marker present");
+  assert.ok(!lines.some((l) => l.startsWith("13-extra-")), "hidden constraints are not injected");
+  // and the marker changes the digest, so the brief is re-injected
+  const without = buildBrief({ contract: DEFAULT_CONTRACT.constraints, corrections: [], loops: [], lastEvidence: null });
+  assert.notEqual(sha1Hex(brief), sha1Hex(without));
+});
+
+test("brief: non-seed constraints carry their source tag; seed ones stay clean", () => {
+  const brief = buildBrief({
+    contract: [
+      ...DEFAULT_CONTRACT.constraints.slice(0, 2),
+      { id: "13-owner-rule", text: "always use pnpm", added: "2026-08-29", source: "user" },
+      { id: "14-agent-rule", text: "never touch main", added: "2026-08-29", source: "agent" },
+    ],
+    corrections: [],
+    loops: [],
+    lastEvidence: null,
+  });
+  assert.ok(brief.includes("13-owner-rule [user]: always use pnpm"));
+  assert.ok(brief.includes("14-agent-rule [agent]: never touch main"));
+  assert.ok(brief.includes("01-obey-instructions: Obey"), "seed constraints stay untagged");
+});

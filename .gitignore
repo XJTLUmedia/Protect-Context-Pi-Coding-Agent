@@ -1,0 +1,8 @@
+.agent-guard/
+.venv/
+__pycache__/
+node_modules/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
