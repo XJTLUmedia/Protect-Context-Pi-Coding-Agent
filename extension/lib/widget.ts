@@ -8,6 +8,10 @@
 export interface WidgetData {
   diffLines: number;
   diffFiles: number;
+  /** False until/unless the Git scope audit succeeds. */
+  diffAvailable?: boolean;
+  /** True when the line count stopped at a bounded untracked scan. */
+  diffLowerBound?: boolean;
   /** Number of commands currently in a failing loop. */
   loops: number;
   /** Evidence (verify runs) recorded this session. */
@@ -17,5 +21,8 @@ export interface WidgetData {
 
 export function renderWidget(d: WidgetData): string {
   const pct = d.ctxPct === null ? 0 : Math.round(d.ctxPct);
-  return `PC Δ+${d.diffLines}L/${d.diffFiles}f ${d.loops}loop ev${d.evidence} ctx${pct}%`;
+  const diff = d.diffAvailable === false
+    ? "Δ?"
+    : `${d.diffLowerBound ? "Δ≥" : "Δ+"}${d.diffLines}L/${d.diffFiles}f`;
+  return `PC ${diff} ${d.loops}loop ev${d.evidence} ctx${pct}%`;
 }

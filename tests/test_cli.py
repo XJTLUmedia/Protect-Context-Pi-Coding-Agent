@@ -1,7 +1,9 @@
 """CLI smoke for EVERY verb; exit codes 0 ok / 1 warning / 2 error (SPEC §3, §7)."""
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 from protect_context import journal, store, verify
@@ -33,7 +35,7 @@ def test_init_creates_store_and_nudges(capsys):
 
 def test_status_smoke(capsys):
     main(["init"])
-    assert main(["status"]) == 0
+    assert main(["status"]) == 1
     out = capsys.readouterr().out
     assert "PC status" in out
     assert out.rstrip().splitlines()[-1].startswith("Nudge:")
@@ -48,6 +50,25 @@ def test_verify_ok_and_fail_exit_codes(capsys):
     out = capsys.readouterr().out
     assert "ev-0001" in out and "ev-0002" in out
     assert "Nudge:" in out
+    assert verify.count() == 2
+
+
+def test_verify_blank_is_error_and_records_nothing(capsys):
+    assert main(["verify", "  \t "]) == 2
+    out = capsys.readouterr().out
+    assert "must not be blank" in out
+    assert out.rstrip().splitlines()[-1].startswith("Nudge:")
+    assert verify.count() == 0
+
+
+def test_third_identical_failed_verify_is_blocked_without_evidence(capsys):
+    assert main(["verify", "false"]) == 1
+    assert main(["verify", "false"]) == 1
+    assert main(["verify", "false"]) == 1
+
+    out = capsys.readouterr().out
+    assert "PC verify blocked" in out
+    assert out.rstrip().splitlines()[-1].startswith("Nudge:")
     assert verify.count() == 2
 
 
@@ -81,6 +102,13 @@ def test_contract_list_add_remove(capsys):
     assert "Nudge:" in out
 
 
+def test_contract_add_blank_is_error(capsys):
+    assert main(["contract", "add", "  "]) == 2
+    out = capsys.readouterr().out
+    assert "must not be blank" in out
+    assert out.rstrip().splitlines()[-1].startswith("Nudge:")
+
+
 # ---- note -------------------------------------------------------------------
 
 def test_note_with_tags(capsys):
@@ -90,6 +118,32 @@ def test_note_with_tags(capsys):
     assert "Nudge:" in out
     entry = journal.recent(1)[0]
     assert entry["tags"] == ["search", "env"] and entry["type"] == "correction"
+
+
+def test_note_rejects_blank_text(capsys):
+    assert main(["note", "decision", "\n\t"]) == 2
+    out = capsys.readouterr().out
+    assert "must not be blank" in out and "Nudge:" in out
+    assert journal.count() == 0
+
+
+# ---- journal ---------------------------------------------------------------
+
+def test_journal_reads_recent_entries_and_filters_type(capsys):
+    journal.add("decision", "Keep the public API stable", ["api"])
+    journal.add("correction", "Use rg, not grep", ["search"])
+
+    assert main(["journal", "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "last 1 of 2" in out and "Use rg, not grep" in out
+    assert "Keep the public API stable" not in out
+    assert out.rstrip().splitlines()[-1].startswith("Nudge:")
+
+    assert main(["journal", "--type", "decision", "--limit", "9999"]) == 0
+    out = capsys.readouterr().out
+    assert "PC journal decision · last 1 of 1" in out
+    assert "Keep the public API stable" in out
+    assert "Use rg, not grep" not in out
 
 
 # ---- loops ------------------------------------------------------------------
@@ -136,6 +190,8 @@ def test_preflight_exit_codes_follow_missing_tools(capsys):
 
     store.write_json(store.config_path(),
                      dict(DEFAULT_CONFIG, preflight_tools=["python3"]))
+    assert main(["preflight"]) == 1  # tools exist, but cwd is not a git repo
+    _git("init", "-q")
     assert main(["preflight"]) == 0
     store.write_json(store.config_path(),
                      dict(DEFAULT_CONFIG, preflight_tools=["no-such-tool-xyz"]))
@@ -173,13 +229,40 @@ def test_init_includes_orientation_digest(capsys):
     assert out.rstrip().splitlines()[-1].startswith("Nudge:")
 
 
+def test_orientation_read_surface(capsys):
+    Path("AGENTS.md").write_text("# rules\n", encoding="utf-8")
+
+    assert main(["orientation"]) == 0
+
+    out = capsys.readouterr().out
+    assert "PC orientation" in out and "AGENTS.md" in out
+    assert out.rstrip().splitlines()[-1].startswith("Nudge:")
+
+
 # ---- contract add: brief-cap warning -----------------------------------------
 
 def test_contract_add_warns_past_brief_cap(capsys):
-    """The 13th constraint exceeds the frozen 12-line brief cap: the ack must
-    say it will NOT be re-injected, not imply it will."""
+    """The 13th constraint exceeds the frozen cap: the ack must disclose
+    provenance-aware selection rather than claim append-order truncation."""
     assert main(["contract", "add", "Keep PRs under 300 lines"]) == 0
     out = capsys.readouterr().out
-    assert "NOT re-injected" in out
+    assert "highest-priority owner/seed" in out
     assert "Nudge:" in out
     assert out.rstrip().splitlines()[-1].startswith("Nudge:")
+
+
+# ---- module entry -------------------------------------------------------------
+
+def test_cli_module_entry_runs_the_cli(tmp_path):
+    """`python -m protect_context.cli` must run the CLI, never silently no-op
+    with exit 0 (goal 2: no unevidenced success)."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "protect_context.cli", "status"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={**os.environ, "PC_SESSION_ID": "test-session"},
+    )
+    assert proc.returncode in (0, 1)
+    assert "PC status" in proc.stdout
+    assert proc.stdout.rstrip().splitlines()[-1].startswith("Nudge:")

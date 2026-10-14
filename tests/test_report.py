@@ -12,14 +12,15 @@ def test_status_dashboard_contents():
     assert "loops: none" in text
     assert "evidence 1 · last ev-0001 exit 0" in text
     assert "contract 12 constraints" in text
-    assert level == 0
+    assert level == 1  # scope audit is unavailable outside a Git repository
     assert text.rstrip().splitlines()[-1].startswith("Nudge:")
 
 
 def test_status_outside_git_repo():
     text, level = report.status()
     assert "Δdiff n/a (not a git repo)" in text
-    assert level == 0
+    assert level == 1
+    assert "before treating scope status as healthy" in text
 
 
 def test_status_evidence_is_scoped_to_session():
@@ -40,3 +41,38 @@ def test_status_includes_conventions_line():
     contract.load()
     text, _level = report.status()
     assert "conventions:" in text
+
+
+def test_status_warning_diff_returns_warning_level(monkeypatch):
+    monkeypatch.setattr(
+        report.diffscope,
+        "diff_audit",
+        lambda cfg: {"added": 450, "deleted": 0, "files": 1, "verdict": "warn"},
+    )
+
+    text, level = report.status()
+
+    assert "verdict warn" in text
+    assert level == 1
+
+
+def test_status_discloses_limited_untracked_scan_as_lower_bound(monkeypatch):
+    monkeypatch.setattr(
+        report.diffscope,
+        "diff_audit",
+        lambda cfg: {
+            "added": 120,
+            "deleted": 0,
+            "files": 4,
+            "verdict": "ok",
+            "untracked_scan_limited": True,
+            "untracked_skipped_files": 2,
+            "untracked_truncated_files": 1,
+        },
+    )
+
+    text, level = report.status()
+
+    assert "untracked line count is a lower bound" in text
+    assert "2 skipped, 1 truncated" in text
+    assert level == 0

@@ -1,14 +1,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { loadContract, addConstraint, removeConstraint, contractLines, nextConstraintId } from "../lib/contract.ts";
+import { delimiter, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  loadContract,
+  addConstraint,
+  addConstraintWithStatus,
+  removeConstraint,
+  contractLines,
+  nextConstraintId,
+} from "../lib/contract.ts";
 import { checkContractSummary, renderChecklist } from "../lib/contract_check.ts";
 import { DEFAULT_CONTRACT } from "../lib/defaults.ts";
 
 function tmpStore(): string {
   return mkdtempSync(join(tmpdir(), "pc-contract-"));
+}
+
+const pythonExe = process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3");
+const projectSrc = fileURLToPath(new URL("../../src", import.meta.url));
+
+function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: process.cwd(), env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} exited ${code}: ${stderr || stdout}`));
+    });
+  });
 }
 
 test("contract: load seeds contract.json with the 12 frozen constraints", () => {
@@ -71,10 +98,139 @@ test("contract: add caps free-text at 500 chars (brief re-injection budget)", ()
   }
 });
 
+test("contract: rejects blank text without appending", () => {
+  const dir = tmpStore();
+  try {
+    assert.throws(() => addConstraint(dir, " \n\t "), /must not be blank/);
+    assert.equal(loadContract(dir).constraints.length, 12);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("contract: added and legacy values render as safe single lines", () => {
+  const dir = tmpStore();
+  try {
+    const added = addConstraint(dir, " owner\nrule\u0000with\u200Bcontrols ");
+    assert.equal(added.text, "owner rule with controls");
+    const rendered = contractLines({
+      version: 1,
+      constraints: [{ id: "13\nlegacy", text: "legacy\u0000 text\nnext", added: "", source: "agent" }],
+    });
+    assert.deepEqual(rendered, ["13 legacy: legacy text next"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("contract: normalized duplicates are returned without another write", () => {
+  const dir = tmpStore();
+  try {
+    const first = addConstraintWithStatus(dir, "owner rule", "user");
+    const duplicate = addConstraintWithStatus(dir, " owner\nrule\u200B ", "user");
+    assert.equal(first.added, true);
+    assert.equal(duplicate.added, false);
+    assert.equal(duplicate.constraint.id, first.constraint.id);
+    assert.equal(loadContract(dir).constraints.length, 13);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("contract: malformed legacy rows are filtered instead of crashing readers", () => {
+  const dir = tmpStore();
+  try {
+    const file = join(dir, ".agent-guard", "contract.json");
+    mkdirSync(join(dir, ".agent-guard"), { recursive: true });
+    const valid = { id: "13-valid", text: "keep me", added: "2026-09-01", source: "user" };
+    writeFileSync(file, JSON.stringify({ version: 1, constraints: [null, 7, { id: "broken" }, valid] }), "utf8");
+    const loaded = loadContract(dir);
+    assert.deepEqual(loaded.constraints, [valid]);
+    assert.deepEqual(contractLines(loaded), ["13-valid: keep me"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("contract: wholly malformed non-empty list falls back to seeds without overwrite", () => {
+  const dir = tmpStore();
+  try {
+    const file = join(dir, ".agent-guard", "contract.json");
+    mkdirSync(join(dir, ".agent-guard"), { recursive: true });
+    const malformed = JSON.stringify({ version: 1, constraints: [null, 7, { id: "broken" }] });
+    writeFileSync(file, malformed, "utf8");
+    assert.deepEqual(loadContract(dir), DEFAULT_CONTRACT);
+    assert.equal(readFileSync(file, "utf8"), malformed, "damaged owner file is not overwritten");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("contract: concurrent Python and Node adds preserve all cross-runtime updates", async () => {
+  const dir = tmpStore();
+  try {
+    const pythonScript = [
+      "import os, sys, time",
+      "from protect_context import contract",
+      "os.chdir(sys.argv[1])",
+      "for i in range(20):",
+      "    contract.add(f'python constraint {i}')",
+      "    time.sleep(0.001)",
+    ].join("\n");
+    const contractUrl = pathToFileURL(fileURLToPath(new URL("../lib/contract.ts", import.meta.url))).href;
+    const nodeScript = [
+      `import { addConstraint } from ${JSON.stringify(contractUrl)};`,
+      "const cwd = process.argv[1];",
+      "const sleeper = new Int32Array(new SharedArrayBuffer(4));",
+      "for (let i = 0; i < 20; i += 1) {",
+      "  addConstraint(cwd, `node constraint ${i}`);",
+      "  Atomics.wait(sleeper, 0, 0, 1);",
+      "}",
+    ].join("\n");
+    const pythonEnv = {
+      ...process.env,
+      PYTHONPATH: [projectSrc, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+    };
+
+    await Promise.all([
+      runChild(pythonExe, ["-c", pythonScript, dir], pythonEnv),
+      runChild(
+        process.execPath,
+        ["--experimental-strip-types", "--input-type=module", "--eval", nodeScript, dir],
+        process.env,
+      ),
+    ]);
+
+    const constraints = loadContract(dir).constraints;
+    const concurrent = constraints.filter((constraint) => constraint.text.includes(" constraint "));
+    assert.equal(concurrent.length, 40);
+    assert.equal(new Set(concurrent.map((constraint) => constraint.id)).size, 40);
+    assert.equal(new Set(concurrent.map((constraint) => constraint.text)).size, 40);
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+  }
+});
+
 test("contract: one compact line per constraint", () => {
   const lines = contractLines(DEFAULT_CONTRACT);
   assert.equal(lines.length, 12);
   assert.ok(lines[0]?.startsWith("01-obey-instructions: Obey the owner's"));
+});
+
+test("contract: rendered list is bounded while retaining seeds and newest entries", () => {
+  const extras = Array.from({ length: 30 }, (_, index) => ({
+    id: `${index + 13}-extra`,
+    text: `extra ${index + 13}`,
+    added: "2026-09-02",
+    source: "user",
+  }));
+  const lines = contractLines({ version: 1, constraints: [...DEFAULT_CONTRACT.constraints, ...extras] });
+
+  assert.equal(lines.length, 25, "one omission line plus 24 constraints");
+  assert.match(lines[0] ?? "", /18 older non-seed constraints omitted/);
+  assert.ok(lines.some((line) => line.startsWith("01-obey-instructions:")));
+  assert.ok(lines.some((line) => line.startsWith("42-extra:")));
+  assert.ok(!lines.some((line) => line.startsWith("13-extra:")));
 });
 
 test("contract_check: heuristic marks addressed vs unclear", () => {
@@ -100,4 +256,13 @@ test("contract_check: empty summary marks everything unclear with a Nudge", () =
   assert.ok(rendered.includes("addressed: (none)"));
   assert.ok(rendered.includes("unclear: 01 02 03 04 05 06 07 08 09 10 11 12"));
   assert.ok(rendered.includes("Nudge:"));
+});
+
+test("contract_check: large custom contracts produce bounded id lists", () => {
+  const rendered = renderChecklist(
+    Array.from({ length: 80 }, (_, index) => ({ id: String(index).padStart(2, "0"), addressed: false })),
+  );
+
+  assert.match(rendered, /unclear: .* \+56 more/);
+  assert.ok(rendered.length < 250);
 });

@@ -60,6 +60,19 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    if not args.command.strip():
+        print("PC verify · error: command must not be blank")
+        print("Nudge: pass a concrete verification command tied to the claim.")
+        return 2
+    cfg = store.load_config()
+    blocked = loops.command_block(args.command, cfg)
+    if blocked:
+        print(
+            f"PC verify blocked · {blocked['cmd'][:80]} · "
+            f"{blocked['count']} prior failures"
+        )
+        print("Nudge: change approach or gather new information — do not re-run unchanged.")
+        return 1
     entry = verify.run_verify(args.command, args.timeout_s)
     print(verify.render_entry(entry))
     return 0 if entry["ok"] else 1
@@ -77,7 +90,12 @@ def cmd_contract(args: argparse.Namespace) -> int:
         print("Nudge: honor these constraints; they are re-injected whenever they change.")
         return 0
     if args.action == "add":
-        c, cons = contract.add(args.text)
+        try:
+            c, cons = contract.add(args.text)
+        except ValueError as e:
+            print(f"contract: {e}")
+            print("Nudge: pass a concrete, non-blank constraint.")
+            return 2
         if c is None:
             print(f"contract: identical constraint already present ({len(cons)} total)")
             print("Nudge: reuse the existing constraint instead of duplicating it.")
@@ -113,6 +131,12 @@ def cmd_note(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_journal(args: argparse.Namespace) -> int:
+    entries = journal.recent(args.limit, args.type)
+    print(journal.render_recent(entries, journal.count(args.type), args.type))
+    return 0
+
+
 def cmd_loops(args: argparse.Namespace) -> int:
     cfg = store.load_config()
     streak_list = loops.streaks()
@@ -131,11 +155,16 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_preflight(args: argparse.Namespace) -> int:
     res = preflight.run_preflight()
     print(preflight.render(res))
-    return 1 if res["missing"] else 0
+    return 1 if (res["missing"] or not res["git_repo"] or res.get("omitted_tools")) else 0
 
 
 def cmd_budget(args: argparse.Namespace) -> int:
     print(budget.render(budget.compute()))
+    return 0
+
+
+def cmd_orientation(args: argparse.Namespace) -> int:
+    print(orientation.digest())
     return 0
 
 
@@ -176,6 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tags", default="", help="comma-separated tags")
     sp.set_defaults(func=cmd_note)
 
+    sp = sub.add_parser("journal", help="read recent journal entries")
+    sp.add_argument("--limit", type=int, default=journal.READ_LIMIT_DEFAULT)
+    sp.add_argument("--type", choices=list(store.JOURNAL_TYPES), default=None)
+    sp.set_defaults(func=cmd_journal)
+
     sp = sub.add_parser("loops", help="failing-command streaks")
     sp.set_defaults(func=cmd_loops)
 
@@ -189,6 +223,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("budget", help="session tool-output budget")
     sp.set_defaults(func=cmd_budget)
 
+    sp = sub.add_parser("orientation", help="bounded repo tree, languages, and conventions")
+    sp.set_defaults(func=cmd_orientation)
+
     return p
 
 
@@ -200,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         print(NUDGE_ERROR)
         return 2
     except Exception as e:  # CLI boundary: report compactly, never crash ugly
-        print(f"PC error: {e}")
+        print(f"PC error: {store.display_text(e, 240) or 'operation failed'}")
         print(NUDGE_ERROR)
         return 2
+
+
+if __name__ == "__main__":  # `python -m protect_context.cli` = `python -m protect_context`
+    raise SystemExit(main())

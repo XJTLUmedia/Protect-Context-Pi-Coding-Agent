@@ -8,8 +8,10 @@
  * repo before acting") has a reachable delivery path in the extension.
  */
 
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { normalizeOneLine } from "./text.ts";
 
 const SKIP_DIRS = new Set([
   "venv",
@@ -59,12 +61,33 @@ function isSkippedDir(name: string): boolean {
   return name.startsWith(".") || SKIP_DIRS.has(name) || name.endsWith(".egg-info");
 }
 
+function displayName(name: string): string {
+  return normalizeOneLine(name, 120) || "(control-only name)";
+}
+
 export interface OrientationScan {
   root: string;
   /** Top-level dirs (with a child sample) then top-level files. */
   tree: string[];
   languages: Array<{ lang: string; count: number }>;
   conventions: string[];
+}
+
+/** Resolve nested launch directories to their containing worktree root.
+ * Failures are intentionally quiet: outside Git (or without Git installed),
+ * orientation remains a bounded scan of the caller-supplied directory. */
+export function orientationRoot(start: string): string {
+  try {
+    const value = execFileSync("git", ["-C", start, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+      maxBuffer: 64 * 1024,
+    }).trim();
+    return value || start;
+  } catch {
+    return start;
+  }
 }
 
 function childrenSample(dir: string): string {
@@ -79,11 +102,14 @@ function childrenSample(dir: string): string {
   for (const name of visible) {
     let isDir = false;
     try {
-      isDir = statSync(join(dir, name)).isDirectory();
+      // lstat prevents a repository symlink from turning this bounded local
+      // orientation scan into a traversal of an arbitrary external tree.
+      isDir = lstatSync(join(dir, name)).isDirectory();
     } catch {
       // unreadable entry: still list it
     }
-    names.push(isDir ? `${name}/` : name);
+    const shown = displayName(name);
+    names.push(isDir ? `${shown}/` : shown);
     if (names.length >= MAX_CHILDREN) break;
   }
   const remaining = visible.length - names.length;
@@ -109,7 +135,7 @@ function languageCounts(root: string): Array<{ lang: string; count: number }> {
       const full = join(dir, name);
       let st;
       try {
-        st = statSync(full);
+        st = lstatSync(full);
       } catch {
         continue;
       }
@@ -131,7 +157,8 @@ function languageCounts(root: string): Array<{ lang: string; count: number }> {
     .sort((a, b) => b.count - a.count || a.lang.localeCompare(b.lang));
 }
 
-export function scanOrientation(root: string): OrientationScan {
+export function scanOrientation(start: string): OrientationScan {
+  const root = orientationRoot(start);
   const dirs: string[] = [];
   const files: string[] = [];
   let entries: string[] = [];
@@ -144,30 +171,30 @@ export function scanOrientation(root: string): OrientationScan {
     if (isSkippedDir(name)) continue;
     let isDir = false;
     try {
-      isDir = statSync(join(root, name)).isDirectory();
+      isDir = lstatSync(join(root, name)).isDirectory();
     } catch {
       // unreadable entry: list as file
     }
     if (isDir) {
       const kids = childrenSample(join(root, name));
-      dirs.push(`${name}/` + (kids ? ` (${kids})` : ""));
+      dirs.push(`${displayName(name)}/` + (kids ? ` (${kids})` : ""));
     } else {
-      files.push(name);
+      files.push(displayName(name));
     }
   }
   const conventions = CONVENTIONS_FILES.filter((c) => {
     try {
-      return statSync(join(root, c)).isFile();
+      return lstatSync(join(root, c)).isFile();
     } catch {
       return false;
     }
   });
-  return { root, tree: dirs.slice(0, MAX_TREE_ENTRIES).concat(files.slice(0, MAX_TREE_ENTRIES)), languages: languageCounts(root), conventions };
+  return { root, tree: dirs.concat(files).slice(0, MAX_TREE_ENTRIES), languages: languageCounts(root), conventions };
 }
 
 /** Compact orientation digest (ends with Nudge) — mirrors orientation.digest(). */
 export function renderOrientation(scan: OrientationScan): string {
-  const name = scan.root.split(/[\\/]/).filter(Boolean).pop() || scan.root;
+  const name = displayName(scan.root.split(/[\\/]/).filter(Boolean).pop() || scan.root);
   const lines = [`PC orientation · ${name}`];
   lines.push(...scan.tree);
   const langs =

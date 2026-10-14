@@ -5,11 +5,53 @@
 
 import type { EventRecord } from "./events.ts";
 import { normalizeCommand } from "./fingerprint.ts";
+import type { VerifyRun } from "./verify.ts";
 
 export interface LoopInfo {
   cmd: string;
   failures: number;
   lastExit: number | null;
+}
+
+interface LoopOutcome {
+  ts: string;
+  cmd: string;
+  ok: boolean | null;
+  exit: number | null;
+  order: number;
+}
+
+function timestampMillis(value: string): number | null {
+  const raw = value.trim();
+  if (raw === "") return null;
+  // Python's legacy writer could omit a zone; both runtimes treat such store
+  // rows as UTC so reconstruction does not depend on the host timezone.
+  const zoned = /(?:z|[+-]\d{2}:\d{2})$/i.test(raw) ? raw : `${raw}Z`;
+  const parsed = Date.parse(zoned);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareOutcomes(a: LoopOutcome, b: LoopOutcome): number {
+  const aMs = timestampMillis(a.ts);
+  const bMs = timestampMillis(b.ts);
+  if (aMs !== null && bMs !== null) return aMs - bMs || a.order - b.order;
+  if (aMs !== null) return -1;
+  if (bMs !== null) return 1;
+  return a.ts.localeCompare(b.ts) || a.order - b.order;
+}
+
+function applyOutcome(map: Map<string, LoopInfo>, outcome: LoopOutcome): void {
+  const cmd = normalizeCommand(outcome.cmd);
+  if (cmd === "") return;
+  if (outcome.ok === true) {
+    map.delete(cmd);
+    return;
+  }
+  if (outcome.ok !== false) return;
+  const cur = map.get(cmd) ?? { cmd, failures: 0, lastExit: null };
+  cur.failures += 1;
+  if (outcome.exit !== null) cur.lastExit = outcome.exit;
+  map.set(cmd, cur);
 }
 
 /**
@@ -23,18 +65,53 @@ export function failedAttempts(events: EventRecord[], session: string): Map<stri
   const map = new Map<string, LoopInfo>();
   for (const e of events) {
     if (e.kind !== "tool_result" || e.session !== session) continue;
-    if (e.cmd === null) continue;
-    const cmd = normalizeCommand(e.cmd); // defensive: storage should be normalized
-    if (e.ok === true) {
-      map.delete(cmd); // success resets the streak
-      continue;
-    }
-    if (e.ok !== false) continue; // ok=null (unknown) → ignored, streak untouched
-    const cur = map.get(cmd) ?? { cmd, failures: 0, lastExit: null };
-    cur.failures += 1;
-    if (e.exit !== null) cur.lastExit = e.exit;
-    map.set(cmd, cur);
+    if (typeof e.cmd !== "string" || e.cmd === "") continue;
+    applyOutcome(map, {
+      ts: typeof e.ts === "string" ? e.ts : "",
+      cmd: e.cmd,
+      ok: typeof e.ok === "boolean" ? e.ok : null,
+      exit: typeof e.exit === "number" && Number.isFinite(e.exit) ? e.exit : null,
+      order: 0,
+    });
   }
+  return map;
+}
+
+/** Reconstruct streaks from both persisted sources in timestamp order.
+ * guard_verify writes the evidence ledger rather than events.jsonl, so using
+ * events alone forgets its failures after a restart. Session scoping is
+ * applied before merging; older sessions can never affect the new one. */
+export function failedAttemptsFromLedgers(
+  events: EventRecord[],
+  runs: VerifyRun[],
+  session: string,
+): Map<string, LoopInfo> {
+  const outcomes: LoopOutcome[] = [];
+  let order = 0;
+  for (const event of events) {
+    if (event.kind !== "tool_result" || event.session !== session || typeof event.cmd !== "string" || event.cmd === "") continue;
+    outcomes.push({
+      ts: typeof event.ts === "string" ? event.ts : "",
+      cmd: event.cmd,
+      ok: typeof event.ok === "boolean" ? event.ok : null,
+      exit: typeof event.exit === "number" && Number.isFinite(event.exit) ? event.exit : null,
+      order: order++,
+    });
+  }
+  for (const run of runs) {
+    if (run.session !== session || typeof run.cmd !== "string" || run.cmd === "") continue;
+    outcomes.push({
+      ts: typeof run.ts === "string" ? run.ts : "",
+      cmd: run.cmd,
+      ok: typeof run.ok === "boolean" ? run.ok : null,
+      exit: typeof run.exit === "number" && Number.isFinite(run.exit) ? run.exit : null,
+      order: order++,
+    });
+  }
+  outcomes.sort(compareOutcomes);
+
+  const map = new Map<string, LoopInfo>();
+  for (const outcome of outcomes) applyOutcome(map, outcome);
   return map;
 }
 

@@ -18,12 +18,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { isAbsolute, relative } from "node:path";
 
 import { DEFAULT_CONFIG, type GuardConfig } from "./lib/defaults.ts";
 import { loadConfig } from "./lib/config.ts";
 import { matchRisk, normalizeCommand } from "./lib/fingerprint.ts";
 import {
-  appendJsonl,
   appendJsonlLocked,
   defaultState,
   ensureStore,
@@ -36,12 +36,25 @@ import {
   verifyRunsPath,
   withStoreLock,
 } from "./lib/store.ts";
-import { addConstraint, contractLines, loadContract, removeConstraint } from "./lib/contract.ts";
-import { appendJournal, isJournalType, readJournal, recentCorrections } from "./lib/journal.ts";
+import { addConstraintWithStatus, contractLines, loadContract, removeConstraint } from "./lib/contract.ts";
+import {
+  appendJournal,
+  isJournalType,
+  readJournal,
+  recentCorrections,
+  recentDecisions,
+  tagsWithRequired,
+} from "./lib/journal.ts";
 import { toolCallEvent, toolResultEvent, bashExitFromResult, type EventRecord } from "./lib/events.ts";
-import { failedAttempts, loopBlockReason, openLoopsFromMap, shouldBlockLoop, type LoopInfo } from "./lib/loops.ts";
+import {
+  failedAttemptsFromLedgers,
+  loopBlockReason,
+  openLoopsFromMap,
+  shouldBlockLoop,
+  type LoopInfo,
+} from "./lib/loops.ts";
 import { buildBrief, sha1Hex, BRIEF_MAX_CONTRACT_LINES, CMD_DISPLAY_MAX, truncLine } from "./lib/brief.ts";
-import { parseShortstat } from "./lib/gitparse.ts";
+import { parseNumstat, parseUntrackedPaths, scanUntrackedFiles } from "./lib/gitparse.ts";
 import { renderWidget } from "./lib/widget.ts";
 import { checkContractSummary, renderChecklist } from "./lib/contract_check.ts";
 import { renderOrientation, scanOrientation } from "./lib/orientation.ts";
@@ -51,6 +64,7 @@ import {
   formatMs,
   nextEvidenceId,
   readVerifyRuns,
+  readVerifyRowsForIds,
   runsForSession,
   type VerifyRun,
 } from "./lib/verify.ts";
@@ -64,11 +78,11 @@ const MAX_VERIFY_TIMEOUT_S = 900;
 export default function (pi: ExtensionAPI) {
   // Session-scoped state (rebuilt on every session_start; new extension
   // instances are created per session by pi).
-  let session = { id: "", started: "", gitHead: null as string | null };
+  let session = { id: "", started: "", gitHead: null as string | null, gitUnborn: false };
   let cfg: GuardConfig = { ...DEFAULT_CONFIG, preflight_tools: [...DEFAULT_CONFIG.preflight_tools] };
   let state = defaultState("", null);
   const startTimes = new Map<string, { start: number; tool: string; cmd: string | null }>();
-  let lastDiff = { lines: 0, files: 0 };
+  let lastDiff = { lines: 0, files: 0, available: false, lowerBound: false };
   let lastCtxPct: number | null = null;
 
   // In-memory guardrail state (goal #12: O(1) hot paths — the event handlers
@@ -76,6 +90,7 @@ export default function (pi: ExtensionAPI) {
   // session and on the cold brief/status paths). Rebuilt on session_start,
   // updated incrementally in the handlers below.
   const loopState = new Map<string, LoopInfo>();
+  let loopLedgerMemo: string | null = null;
   let evidenceCount = 0;
   // Evidence memo (goal #12 hot-path invariant): before_agent_start runs every
   // turn, and readJsonl already caches the ledger parse by mtime+size — this
@@ -92,6 +107,19 @@ export default function (pi: ExtensionAPI) {
   // before_agent_start when its digest changes.
   let orientationText: string | null = null;
 
+  /** Frozen watermark defaults are zero, so a configured zero threshold needs
+   * an explicit first-notification bit instead of the usual `watermark < 0`.
+   * Positive thresholds retain the original monotonic watermark behavior. */
+  function thresholdDue(value: number, threshold: number, watermark: number, zeroKey: string): boolean {
+    if (value < threshold) return false;
+    if (threshold === 0) return state.counters[zeroKey] !== 1;
+    return watermark < threshold;
+  }
+
+  function markZeroThreshold(threshold: number, zeroKey: string): void {
+    if (threshold === 0) state.counters[zeroKey] = 1;
+  }
+
   // --- helpers ---------------------------------------------------------
 
   /** Run an event/command body without ever throwing (SPEC §5). */
@@ -100,7 +128,7 @@ export default function (pi: ExtensionAPI) {
       return await fn();
     } catch (err) {
       try {
-        ctx.ui.notify(`guard: ${err instanceof Error ? err.message : String(err)}`, "error");
+        if (ctx.hasUI) ctx.ui.notify(`guard: ${err instanceof Error ? err.message : String(err)}`, "error");
       } catch {
         // No UI available; drop the error.
       }
@@ -133,13 +161,14 @@ export default function (pi: ExtensionAPI) {
    *  verify.TIMEOUT_MAX_S on the Python side) so a model-supplied value can
    *  never wedge the session for hours. */
   async function shExec(
-    ctx: ExtensionContext,
     command: string,
     timeoutS: number,
+    signal?: AbortSignal,
   ): Promise<{ exit: number; stdout: string; stderr: string; ms: number }> {
     const t0 = Date.now();
     const res = await pi.exec("sh", ["-c", command], {
       timeout: Math.min(MAX_VERIFY_TIMEOUT_S, Math.max(1, timeoutS)) * 1000,
+      signal,
     });
     const ms = Date.now() - t0;
     const exit = res.killed && res.code === 0 ? 124 : res.code;
@@ -150,12 +179,111 @@ export default function (pi: ExtensionAPI) {
     return readJsonl<EventRecord>(eventsPath(cwd));
   }
 
-  /** Rebuild in-memory loop streaks from disk (once per session). */
-  function rebuildLoopState(cwd: string): void {
+  function loopLedgerStamp(cwd: string): string {
+    return `${fileStamp(eventsPath(cwd)) ?? "-"}|${fileStamp(verifyRunsPath(cwd)) ?? "-"}`;
+  }
+
+  /** Replace the in-memory view while the shared store lock is held. */
+  function rebuildLoopStateUnlocked(cwd: string): void {
     loopState.clear();
-    for (const info of failedAttempts(readEvents(cwd), session.id).values()) {
+    for (const info of failedAttemptsFromLedgers(readEvents(cwd), readVerifyRuns(cwd), session.id).values()) {
       loopState.set(info.cmd, info);
     }
+    loopLedgerMemo = loopLedgerStamp(cwd);
+  }
+
+  /** Rebuild at startup, or when a CLI/MCP peer changed either ledger. */
+  function rebuildLoopState(cwd: string): void {
+    withStoreLock(storeDir(cwd), () => rebuildLoopStateUnlocked(cwd));
+  }
+
+  function refreshLoopStateIfChanged(cwd: string): void {
+    if (loopLedgerMemo === loopLedgerStamp(cwd)) return;
+    withStoreLock(storeDir(cwd), () => {
+      if (loopLedgerMemo !== loopLedgerStamp(cwd)) rebuildLoopStateUnlocked(cwd);
+    });
+  }
+
+  interface DiffSnapshot {
+    files: number;
+    lines: number;
+    repo: boolean;
+    unborn: boolean;
+    available: boolean;
+    scanLimited: boolean;
+    skippedFiles: number;
+    truncatedFiles: number;
+  }
+
+  function unavailableDiff(repo: boolean, unborn: boolean): DiffSnapshot {
+    return {
+      files: 0,
+      lines: 0,
+      repo,
+      unborn,
+      available: false,
+      scanLimited: false,
+      skippedFiles: 0,
+      truncatedFiles: 0,
+    };
+  }
+
+  /** Count tracked, staged and non-ignored untracked work. `git status`
+   * supplies the untracked set so .gitignore semantics remain Git's own; the
+   * bounded scanner only measures those selected files. An unborn HEAD uses
+   * one empty-tree-to-working-tree numstat instead of silently reporting Δ0
+   * or double-counting staged files edited again. */
+  async function gatherDiff(ctx: ExtensionContext): Promise<DiffSnapshot> {
+    const rootOut = await runGit(ctx, ["rev-parse", "--show-toplevel"]);
+    if (rootOut === null || rootOut.trim() === "") return unavailableDiff(false, false);
+    const root = rootOut.trim();
+    const head = await runGit(ctx, ["rev-parse", "--verify", "HEAD"]);
+    const unborn = head === null;
+
+    let tracked;
+    if (unborn) {
+      // A single diff from Git's repository-format-specific empty tree to the
+      // final working tree avoids double-counting a staged file edited again.
+      // `hash-object` without -w is read-only; pi.exec supplies EOF on stdin.
+      const emptyTreeOut = await runGit(ctx, ["hash-object", "-t", "tree", "--stdin"]);
+      const emptyTree = emptyTreeOut?.trim() ?? "";
+      if (emptyTree === "") return unavailableDiff(true, true);
+      const out = await runGit(ctx, ["diff", "--numstat", emptyTree, "--"]);
+      if (out === null) return unavailableDiff(true, true);
+      tracked = parseNumstat(out);
+    } else {
+      const out = await runGit(ctx, ["diff", "--numstat", "HEAD", "--"]);
+      if (out === null) return unavailableDiff(true, false);
+      tracked = parseNumstat(out);
+    }
+
+    const status = await runGit(ctx, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--"]);
+    if (status === null) return unavailableDiff(true, unborn);
+    const storeRelRaw = relative(root, storeDir(ctx.cwd));
+    const storeRel = storeRelRaw.replaceAll("\\", "/");
+    const activeStore =
+      storeRel !== "" &&
+      storeRel !== ".." &&
+      !storeRel.startsWith("../") &&
+      !isAbsolute(storeRelRaw)
+        ? storeRel
+        : null;
+    const untrackedPaths = parseUntrackedPaths(status, activeStore);
+    const untracked = scanUntrackedFiles(
+      root,
+      untrackedPaths,
+      Math.max(0, cfg.diff_hard_lines - tracked.lines),
+    );
+    return {
+      files: tracked.fileCount + untracked.files,
+      lines: tracked.lines + untracked.lines,
+      repo: true,
+      unborn,
+      available: true,
+      scanLimited: untracked.scanLimited,
+      skippedFiles: untracked.skippedFiles,
+      truncatedFiles: untracked.truncatedFiles,
+    };
   }
 
   /** Incremental loop-state update for a finished bash call (O(1)). */
@@ -176,6 +304,7 @@ export default function (pi: ExtensionAPI) {
   function sessionEvidence(cwd: string): { last: VerifyRun | null; count: number } {
     const stamp = fileStamp(verifyRunsPath(cwd));
     if (evidenceMemo && evidenceMemo.sessionId === session.id && evidenceMemo.stamp === stamp) {
+      evidenceCount = evidenceMemo.count;
       return { last: evidenceMemo.last, count: evidenceMemo.count };
     }
     const runs = runsForSession(readVerifyRuns(cwd), session.id);
@@ -185,6 +314,7 @@ export default function (pi: ExtensionAPI) {
       last: runs.length > 0 ? runs[runs.length - 1] : null,
       count: runs.length,
     };
+    evidenceCount = evidenceMemo.count;
     return { last: evidenceMemo.last, count: evidenceMemo.count };
   }
 
@@ -221,6 +351,8 @@ export default function (pi: ExtensionAPI) {
       const line = renderWidget({
         diffLines: lastDiff.lines,
         diffFiles: lastDiff.files,
+        diffAvailable: lastDiff.available,
+        diffLowerBound: lastDiff.lowerBound,
         loops: openLoopCount(),
         evidence: evidenceCount,
         ctxPct: lastCtxPct,
@@ -232,14 +364,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function gatherStatus(ctx: ExtensionContext): Promise<StatusData> {
-    const out = await runGit(ctx, ["diff", "--shortstat", "HEAD"]);
-    const d = out === null ? { files: 0, lines: 0 } : parseShortstat(out);
+    refreshLoopStateIfChanged(ctx.cwd);
+    const d = await gatherDiff(ctx);
+    lastDiff = { files: d.files, lines: d.lines, available: d.available, lowerBound: d.scanLimited };
     const ev = sessionEvidence(ctx.cwd);
     return {
       session: session.id,
       gitHead: session.gitHead,
+      gitUnborn: d.unborn,
+      diffAvailable: d.available,
       diffLines: d.lines,
       diffFiles: d.files,
+      diffScanLimited: d.scanLimited,
+      diffSkippedFiles: d.skippedFiles,
+      diffTruncatedFiles: d.truncatedFiles,
       loops: openLoopsFromMap(loopState, cfg.loop_block_after),
       evidenceCount: ev.count,
       contractCount: loadContract(ctx.cwd).constraints.length,
@@ -247,6 +385,7 @@ export default function (pi: ExtensionAPI) {
       ctxPct: lastCtxPct,
       diffWarnLines: cfg.diff_warn_lines,
       diffHardLines: cfg.diff_hard_lines,
+      diffWarnFiles: cfg.diff_warn_files,
     };
   }
 
@@ -257,7 +396,11 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     command: string,
     timeoutSraw: number,
+    signal?: AbortSignal,
   ): Promise<string> {
+    if (typeof command !== "string" || command.trim() === "") {
+      throw new Error("verification command must not be blank");
+    }
     const fp = normalizeCommand(command);
     const timeoutS = clampTimeoutS(timeoutSraw);
 
@@ -266,7 +409,10 @@ export default function (pi: ExtensionAPI) {
     const risk = matchRisk(fp);
     if (risk) {
       if (ctx.hasUI && cfg.risk_confirm) {
-        const ok = await ctx.ui.confirm("Risky command", `'${fp}' matches '${risk}'. Run anyway?`);
+        const ok = await ctx.ui.confirm(
+          "Risky command",
+          `'${truncLine(fp, 160)}' matches '${risk}'. Run anyway?`,
+        );
         if (!ok) {
           return `guard: risky command declined (${risk}) — not run, not recorded.\nNudge: split off the destructive step and run the safe part here.`;
         }
@@ -283,17 +429,22 @@ export default function (pi: ExtensionAPI) {
     }
 
     // (b) loop check on fingerprint — identical arithmetic to the bash path
+    refreshLoopStateIfChanged(ctx.cwd);
     const failures = loopState.get(fp)?.failures ?? 0;
     if (shouldBlockLoop(failures, cfg.loop_block_after)) {
-      return `${loopBlockReason(fp, failures)}\nNudge: not run, not recorded — change approach or gather new information first.`;
+      return `${loopBlockReason(truncLine(fp, CMD_DISPLAY_MAX), failures)}\nNudge: not run, not recorded — change approach or gather new information first.`;
     }
 
-    const res = await shExec(ctx, command, timeoutS);
+    const res = await shExec(command, timeoutS, signal);
     const run = withStoreLock(storeDir(ctx.cwd), () => {
+      // A CLI/MCP writer may have appended while the command ran. Rebuild
+      // before applying this outcome so its streak is neither lost nor
+      // double-counted.
+      if (loopLedgerMemo !== loopLedgerStamp(ctx.cwd)) rebuildLoopStateUnlocked(ctx.cwd);
       const r: VerifyRun = {
         // Id allocated INSIDE the store lock: two concurrent writers
         // (extension + MCP server + CLI) can never mint the same ev-NNNN.
-        id: nextEvidenceId(readVerifyRuns(ctx.cwd)),
+        id: nextEvidenceId(readVerifyRowsForIds(ctx.cwd)),
         ts: new Date().toISOString(),
         session: session.id || "default",
         cmd: command.trim(),
@@ -303,12 +454,14 @@ export default function (pi: ExtensionAPI) {
         ms: res.ms,
       };
       appendJsonlLocked(verifyRunsPath(ctx.cwd), r);
+      recordLoopOutcome(fp, r.ok, r.exit);
+      loopLedgerMemo = loopLedgerStamp(ctx.cwd);
       return r;
     });
-    evidenceCount += 1;
-    // guard_verify is not an escape hatch from goal #9: its outcomes feed the
-    // same in-memory streaks as bash runs (fail +1, success resets).
-    recordLoopOutcome(fp, run.ok, run.exit);
+    // Recompute from the stamped ledger so concurrent external evidence is
+    // reflected in the widget rather than incrementing a stale counter.
+    evidenceMemo = null;
+    sessionEvidence(ctx.cwd);
     renderWidgetNow(ctx);
     const lines: string[] = [`${run.id} exit=${run.exit} ${formatMs(run.ms)} '${truncLine(run.cmd, CMD_DISPLAY_MAX)}'`];
     if (!run.ok) {
@@ -329,10 +482,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) =>
     attempt(ctx, async () => {
       ensureStore(ctx.cwd);
-      cfg = loadConfig(ctx.cwd).config;
+      // Seed defaults for extension-only installs; existing user or corrupt
+      // files are preserved by loadConfig.
+      cfg = loadConfig(ctx.cwd, true).config;
       session.id = safeSessionId(ctx);
       session.started = new Date().toISOString();
-      session.gitHead = await runGit(ctx, ["rev-parse", "HEAD"]);
+      const repoRoot = await runGit(ctx, ["rev-parse", "--show-toplevel"]);
+      const head = await runGit(ctx, ["rev-parse", "--verify", "HEAD"]);
+      session.gitHead = head?.trim() || null;
+      session.gitUnborn = repoRoot !== null && session.gitHead === null;
       loadContract(ctx.cwd); // seeds contract.json from DEFAULT_CONTRACT if missing
 
       const prev = loadState(ctx.cwd);
@@ -357,14 +515,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (_event, ctx) =>
     attempt(ctx, async () => {
+      refreshLoopStateIfChanged(ctx.cwd);
       const contract = loadContract(ctx.cwd);
-      const corrections = recentCorrections(readJournal(ctx.cwd), 3);
+      const journal = readJournal(ctx.cwd);
+      const decisions = recentDecisions(journal, 3);
+      const corrections = recentCorrections(journal, 3);
       // In-memory streaks are the merged view (bash events + guard_verify
       // outcomes) — the disk events alone would miss verify streaks.
       const loops = openLoopsFromMap(loopState, cfg.loop_block_after).slice(0, 2);
       const last = sessionEvidence(ctx.cwd).last;
       const brief = buildBrief({
         contract: contract.constraints,
+        decisions,
         corrections,
         loops,
         lastEvidence: last ? { id: last.id, exit: last.exit, cmd: last.cmd, ms: last.ms } : null,
@@ -410,7 +572,10 @@ export default function (pi: ExtensionAPI) {
       const risk = matchRisk(fp);
       if (risk) {
         if (ctx.hasUI && cfg.risk_confirm) {
-          const ok = await ctx.ui.confirm("Risky command", `'${fp}' matches '${risk}'. Run anyway?`);
+          const ok = await ctx.ui.confirm(
+            "Risky command",
+            `'${truncLine(fp, 160)}' matches '${risk}'. Run anyway?`,
+          );
           if (!ok) {
             // pi still emits tool_execution_end for blocked calls (with the
             // block reason as the result) — mark it so the end handler does
@@ -434,15 +599,22 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // (b) loop check on fingerprint (in-memory streaks — O(1))
-      const failures = loopState.get(fp)?.failures ?? 0;
-      if (shouldBlockLoop(failures, cfg.loop_block_after)) {
+      // (b) Recheck + record atomically with respect to CLI/MCP writers. This
+      // prevents an external second failure from being missed between a stale
+      // in-memory check and the tool-call record.
+      const blockedFailures = withStoreLock(storeDir(ctx.cwd), () => {
+        if (loopLedgerMemo !== loopLedgerStamp(ctx.cwd)) rebuildLoopStateUnlocked(ctx.cwd);
+        const failures = loopState.get(fp)?.failures ?? 0;
+        if (shouldBlockLoop(failures, cfg.loop_block_after)) return failures;
+        appendJsonlLocked(eventsPath(ctx.cwd), toolCallEvent(session.id, "bash"));
+        loopLedgerMemo = loopLedgerStamp(ctx.cwd);
+        return null;
+      });
+      if (blockedFailures !== null) {
         blockedToolCallIds.add(event.toolCallId);
-        return { block: true, reason: loopBlockReason(fp, failures) };
+        return { block: true, reason: loopBlockReason(truncLine(fp, CMD_DISPLAY_MAX), blockedFailures) };
       }
 
-      // (c) record the attempt
-      appendJsonl(eventsPath(ctx.cwd), toolCallEvent(session.id, "bash"));
       return undefined;
     }),
   );
@@ -484,22 +656,30 @@ export default function (pi: ExtensionAPI) {
         cmd = meta?.cmd ?? null;
         if (event.isError) {
           exit = bashExitFromResult(text);
-          // Aborted/cancelled runs (isError with no parseable exit, e.g. the
-          // user hitting Esc) are NOT failed runs: ok=null keeps them out of
-          // loop streaks — both loop implementations ignore ok=null — while
-          // the timing/size telemetry is kept.
-          if (exit === null) ok = null;
+          // isError is authoritative even when a provider omits the textual
+          // exit-code suffix. Unknown exit remains null, but the outcome must
+          // still count as a failure rather than silently disappearing from
+          // loop protection.
+          ok = false;
+        } else {
+          // Pi omits bash exit details on success; persist the known shell
+          // convention explicitly so the shared event format is unambiguous.
+          exit = 0;
+          ok = true;
         }
       }
 
-      appendJsonl(
-        eventsPath(ctx.cwd),
-        toolResultEvent(session.id, event.toolName, { ok, ms, outChars, cmd, exit }),
-      );
-
-      // Incremental streak update (bash only; O(1) — no file re-read).
-      // ok=null (aborted/unknown) leaves streaks untouched, like loops.py.
-      if (cmd !== null && ok !== null) recordLoopOutcome(cmd, ok, exit);
+      withStoreLock(storeDir(ctx.cwd), () => {
+        if (loopLedgerMemo !== loopLedgerStamp(ctx.cwd)) rebuildLoopStateUnlocked(ctx.cwd);
+        appendJsonlLocked(
+          eventsPath(ctx.cwd),
+          toolResultEvent(session.id, event.toolName, { ok, ms, outChars, cmd, exit }),
+        );
+        // Incremental streak update (bash only). The rebuild above first
+        // incorporates external writers, then this result is applied once.
+        if (cmd !== null && ok !== null) recordLoopOutcome(cmd, ok, exit);
+        loopLedgerMemo = loopLedgerStamp(ctx.cwd);
+      });
 
       renderWidgetNow(ctx);
       return undefined;
@@ -514,8 +694,13 @@ export default function (pi: ExtensionAPI) {
         if (usage && usage.percent !== null) {
           lastCtxPct = usage.percent;
           const step = Math.floor(usage.percent / 10) * 10;
-          if (step >= cfg.ctx_warn_pct && step > state.notify_watermarks.ctx_pct) {
+          const contextDue =
+            step >= cfg.ctx_warn_pct &&
+            (step > state.notify_watermarks.ctx_pct ||
+              (cfg.ctx_warn_pct === 0 && state.counters.ctx_zero_notified !== 1));
+          if (contextDue) {
             state.notify_watermarks.ctx_pct = step;
+            markZeroThreshold(cfg.ctx_warn_pct, "ctx_zero_notified");
             saveState(ctx.cwd, state);
             if (ctx.hasUI) {
               ctx.ui.notify(
@@ -530,22 +715,31 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Diff budget (goal #8)
-      const out = await runGit(ctx, ["diff", "--shortstat", "HEAD"]);
-      if (out !== null) {
-        const { files, lines } = parseShortstat(out);
-        lastDiff = { files, lines };
+      const diff = await gatherDiff(ctx);
+      lastDiff = {
+        files: diff.files,
+        lines: diff.lines,
+        available: diff.available,
+        lowerBound: diff.scanLimited,
+      };
+      if (diff.repo && diff.available) {
+        const { files, lines } = diff;
         const wm = state.notify_watermarks;
-        if (lines >= cfg.diff_hard_lines && wm.diff_lines < cfg.diff_hard_lines) {
-          wm.diff_lines = cfg.diff_hard_lines;
-          saveState(ctx.cwd, state);
-          if (ctx.hasUI) {
-            ctx.ui.notify(
-              `guard: diff reached ${lines} lines (hard limit ${cfg.diff_hard_lines}) — split before continuing.`,
-              "error",
-            );
+        if (lines >= cfg.diff_hard_lines) {
+          if (thresholdDue(lines, cfg.diff_hard_lines, wm.diff_lines, "diff_hard_zero_notified")) {
+            wm.diff_lines = Math.max(wm.diff_lines, cfg.diff_hard_lines);
+            markZeroThreshold(cfg.diff_hard_lines, "diff_hard_zero_notified");
+            saveState(ctx.cwd, state);
+            if (ctx.hasUI) {
+              ctx.ui.notify(
+                `guard: diff reached ${lines} lines (hard limit ${cfg.diff_hard_lines}) — split before continuing.`,
+                "error",
+              );
+            }
           }
-        } else if (lines >= cfg.diff_warn_lines && wm.diff_lines < cfg.diff_warn_lines) {
-          wm.diff_lines = cfg.diff_warn_lines;
+        } else if (thresholdDue(lines, cfg.diff_warn_lines, wm.diff_lines, "diff_warn_zero_notified")) {
+          wm.diff_lines = Math.max(wm.diff_lines, cfg.diff_warn_lines);
+          markZeroThreshold(cfg.diff_warn_lines, "diff_warn_zero_notified");
           saveState(ctx.cwd, state);
           if (ctx.hasUI) {
             ctx.ui.notify(
@@ -554,8 +748,9 @@ export default function (pi: ExtensionAPI) {
             );
           }
         }
-        if (files >= cfg.diff_warn_files && wm.diff_files < cfg.diff_warn_files) {
-          wm.diff_files = cfg.diff_warn_files;
+        if (thresholdDue(files, cfg.diff_warn_files, wm.diff_files, "diff_files_zero_notified")) {
+          wm.diff_files = Math.max(wm.diff_files, cfg.diff_warn_files);
+          markZeroThreshold(cfg.diff_warn_files, "diff_files_zero_notified");
           saveState(ctx.cwd, state);
           if (ctx.hasUI) {
             ctx.ui.notify(`guard: diff touched ${files} files (warn ${cfg.diff_warn_files}) — check scope.`, "warning");
@@ -568,6 +763,18 @@ export default function (pi: ExtensionAPI) {
     }),
   );
 
+  // Compaction removes the previously injected hidden brief from active
+  // context. Invalidate both digests so the next turn re-injects constraints,
+  // trusted journal entries and orientation even when their text is unchanged.
+  pi.on("session_compact", async (_event, ctx) =>
+    attempt(ctx, async () => {
+      state.brief_digest = null;
+      delete state.counters.orient_sha1;
+      saveState(ctx.cwd, state);
+      return undefined;
+    }),
+  );
+
   pi.on("session_shutdown", async (_event, ctx) => {
     // Idempotent persistence; no UI during shutdown.
     try {
@@ -575,6 +782,15 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // best-effort
     }
+    startTimes.clear();
+    loopState.clear();
+    blockedToolCallIds.clear();
+    loopLedgerMemo = null;
+    evidenceMemo = null;
+    orientationText = null;
+    evidenceCount = 0;
+    lastDiff = { lines: 0, files: 0, available: false, lowerBound: false };
+    lastCtxPct = null;
     return undefined;
   });
 
@@ -599,10 +815,11 @@ export default function (pi: ExtensionAPI) {
         const verb = parts[0] ?? "";
         const rest = parts.slice(1).join(" ").trim();
         if (verb === "" || verb === "list") {
-          const lines = contractLines(loadContract(ctx.cwd));
+          const current = loadContract(ctx.cwd);
+          const lines = contractLines(current);
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `contract (${lines.length}):\n${lines.join("\n")}\nNudge: add missing constraints with /guard-contract add <text>.`,
+              `contract (${current.constraints.length}):\n${lines.join("\n")}\nNudge: add missing constraints with /guard-contract add <text>.`,
               "info",
             );
           }
@@ -613,19 +830,24 @@ export default function (pi: ExtensionAPI) {
             if (ctx.hasUI) ctx.ui.notify("usage: /guard-contract add <text>", "warning");
             return undefined;
           }
-          const c = addConstraint(ctx.cwd, rest);
-          const total = loadContract(ctx.cwd).constraints.length;
+          // Slash commands are direct owner interaction and therefore trusted
+          // by brief prioritization; model-callable writes use provenance tags.
+          const result = addConstraintWithStatus(ctx.cwd, rest, "user");
+          const c = result.constraint;
+          const total = result.total;
           if (ctx.hasUI) {
             // SPEC §5 caps the re-injected brief at 12 contract lines: a
             // constraint past the cap would be silently DROPPED while the
             // owner believes it is enforced — warn instead.
             const over = total > BRIEF_MAX_CONTRACT_LINES;
-            const ack = over
+            const ack = !result.added
+              ? `constraint ${c.id} already exists\nNudge: no duplicate was written.`
+              : over
               ? `added ${c.id}\nwarning: ${total} constraints exceed the ${BRIEF_MAX_CONTRACT_LINES}-line brief cap — ` +
-                `constraints beyond ${BRIEF_MAX_CONTRACT_LINES} are NOT re-injected by the brief.` +
+                `only the ${BRIEF_MAX_CONTRACT_LINES} highest-priority owner/seed constraints are re-injected.` +
                 `\nNudge: keep the contract tight — fewer, sharper constraints survive re-injection.`
               : `added ${c.id}\nNudge: the brief re-injects on your next prompt.`;
-            ctx.ui.notify(ack, over ? "warning" : "info");
+            ctx.ui.notify(ack, result.added && over ? "warning" : "info");
           }
           return undefined;
         }
@@ -688,7 +910,12 @@ export default function (pi: ExtensionAPI) {
             `diff_hard=${cfg.diff_hard_lines}L ctx_warn=${cfg.ctx_warn_pct}% brief=${cfg.brief_mode} risk_confirm=${cfg.risk_confirm}`,
         );
         if (st.loops.length > 0) {
-          lines.push(`loops: ${st.loops.map((l) => `'${truncLine(l.cmd, CMD_DISPLAY_MAX)}'x${l.failures}`).join(", ")}`);
+          const visibleLoops = st.loops.slice(0, 5);
+          const hidden = st.loops.length - visibleLoops.length;
+          lines.push(
+            `loops: ${visibleLoops.map((l) => `'${truncLine(l.cmd, CMD_DISPLAY_MAX)}'x${l.failures}`).join(", ")}` +
+              (hidden > 0 ? `, +${hidden} more` : ""),
+          );
         }
         lines.push("Nudge: use /guard-verify for evidence and /guard-note to persist decisions.");
         if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
@@ -713,8 +940,8 @@ export default function (pi: ExtensionAPI) {
       command: Type.String({ description: "Shell command to run for verification" }),
       timeout_s: Type.Optional(Type.Integer({ description: "Timeout in seconds (default 180, clamped to 1–900)" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const out = await runVerifyAndRecord(ctx, params.command, params.timeout_s ?? 180);
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const out = await runVerifyAndRecord(ctx, params.command, params.timeout_s ?? 180, signal);
       return { content: [{ type: "text", text: out }], details: {} };
     },
   });
@@ -724,7 +951,8 @@ export default function (pi: ExtensionAPI) {
     label: "Guard Note",
     description:
       "Append a decision/correction/risk/note to the persistent journal (.agent-guard/journal.jsonl). " +
-      "Corrections are re-injected into the brief on change.",
+      "Model-written entries are tagged agent and persisted for owner review; they are not trusted brief input. " +
+      "Only trusted slash-command/CLI decisions and corrections are re-injected.",
     promptSnippet: "Record a durable decision or correction in the journal",
     promptGuidelines: [
       "Use guard_note to record durable decisions; when corrected, log a tagged correction with type=correction.",
@@ -735,7 +963,11 @@ export default function (pi: ExtensionAPI) {
       tags: Type.Optional(Type.Array(Type.String({ description: "Optional tags" }))),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const entry = appendJournal(ctx.cwd, { type: params.type, text: params.text, tags: params.tags ?? [] });
+      const entry = appendJournal(ctx.cwd, {
+        type: params.type,
+        text: params.text,
+        tags: tagsWithRequired(params.tags ?? [], "agent"),
+      });
       return {
         content: [
           {

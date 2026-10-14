@@ -10,10 +10,12 @@ exactly like the agent running the command itself.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 
 from . import journal, store
@@ -22,6 +24,8 @@ DIGEST_MAX = 2000  # last ≤2000 chars of combined stdout+stderr (SPEC §2)
 TIMEOUT_EXIT = 124  # GNU timeout convention for recorded timeouts
 TIMEOUT_MIN_S = 1
 TIMEOUT_MAX_S = 900  # upper clamp: no single guard_verify call can wedge a session
+RECENT_LIMIT_DEFAULT = 5
+RECENT_LIMIT_MAX = 20
 
 # Deny-confirm risk patterns (SPEC §5 list, anchored to exact targets).
 # guard_verify consults them to LOG (never block — advisory-first): running a
@@ -70,43 +74,66 @@ def _clamp_timeout(timeout_s: int) -> int:
     return max(TIMEOUT_MIN_S, min(TIMEOUT_MAX_S, t))
 
 
+def _terminate_timed_out_process(p: subprocess.Popen) -> None:
+    """Kill the POSIX process group, or the child process on other platforms."""
+    if os.name == "posix":
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        p.kill()
+    except OSError:
+        pass
+
+
+def _tail_file_text(stream, max_chars: int = DIGEST_MAX) -> str:
+    """Decode at most the final ``max_chars`` from a binary temporary file."""
+    stream.flush()
+    size = stream.seek(0, os.SEEK_END)
+    # A UTF-8 code point uses at most four bytes. The small overlap avoids
+    # beginning inside a multibyte sequence before the final character slice.
+    stream.seek(max(0, size - max_chars * 4 - 4))
+    return stream.read().decode("utf-8", errors="replace")[-max_chars:]
+
+
 def run_verify(command: str, timeout_s: int = 180) -> dict:
     """Run `command` via the shell and append it to verify_runs.jsonl. NEVER
     raises on nonzero exit — records it. A timeout is recorded as exit 124
     with ok=False.
 
     timeout_s is clamped to [TIMEOUT_MIN_S, TIMEOUT_MAX_S] so a model-supplied
-    value cannot wedge the session. The child starts in its own process group
-    (start_new_session) and the WHOLE group is SIGKILLed on timeout, so
-    grandchildren holding the stdout/stderr pipes cannot hang the drain — the
-    evidence entry is always written.
+    value cannot wedge the session. On POSIX, the child starts in its own
+    process group and the whole group is killed on timeout. Other platforms
+    use ``Popen.kill``. Output is redirected to temporary files and only the
+    bounded tail is read into memory.
     """
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("verification command must not be blank")
     timeout_s = _clamp_timeout(timeout_s)
     t0 = time.monotonic()
     timed_out = False
-    p = subprocess.Popen(
-        command,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        out_b, err_b = p.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        p = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=out_file,
+            stderr=err_file,
+            **popen_kwargs,
+        )
         try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            p.kill()  # best-effort fallback if the group vanished
-        out_b, err_b = p.communicate()  # drains pipes; returns after the kill
-    out = (out_b or b"").decode("utf-8", errors="replace")
-    err = (err_b or b"").decode("utf-8", errors="replace")
+            p.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_timed_out_process(p)
+            p.wait()
+        combined = (_tail_file_text(out_file) + _tail_file_text(err_file))[-DIGEST_MAX:]
     exit_code = TIMEOUT_EXIT if timed_out else p.returncode
     ok = exit_code == 0 and not timed_out
-    combined = out + err
     if timed_out:
-        combined += f"\n[guard_verify: timeout after {timeout_s}s]"
+        combined = (combined + f"\n[guard_verify: timeout after {timeout_s}s]")[-DIGEST_MAX:]
 
     risk = match_risk(command)
     if risk:
@@ -126,7 +153,7 @@ def run_verify(command: str, timeout_s: int = 180) -> dict:
             "cmd": command,
             "exit": exit_code,
             "ok": ok,
-            "digest": combined[-DIGEST_MAX:],
+            "digest": combined,
             "ms": int((time.monotonic() - t0) * 1000),
         }
 
@@ -139,19 +166,47 @@ def _scoped(runs: list[dict], session: str | None) -> list[dict]:
     return [r for r in runs if r.get("session") == session]
 
 
-def recent(limit: int = 5, session: str | None = None) -> list[dict]:
+def _valid_runs() -> list[dict]:
+    """Typed evidence rows only; malformed JSON objects are ignored safely."""
+    required_strings = ("id", "ts", "session", "cmd", "digest")
+    valid: list[dict] = []
+    for row in store.read_jsonl(store.verify_path()):
+        if not all(isinstance(row.get(key), str) for key in required_strings):
+            continue
+        if not isinstance(row.get("ok"), bool):
+            continue
+        exit_code = row.get("exit")
+        ms = row.get("ms")
+        if (
+            isinstance(exit_code, bool)
+            or not isinstance(exit_code, (int, float))
+            or not math.isfinite(exit_code)
+            or isinstance(ms, bool)
+            or not isinstance(ms, (int, float))
+            or not math.isfinite(ms)
+        ):
+            continue
+        valid.append(row)
+    return valid
+
+
+def recent(limit: int = RECENT_LIMIT_DEFAULT, session: str | None = None) -> list[dict]:
     """Recent runs, oldest first. session=None → the whole ledger; a session
     label scopes to that session's runs (parity with the extension, which
     counts evidence per session)."""
-    runs = _scoped(store.read_jsonl(store.verify_path()), session)
-    if limit <= 0:
+    runs = _scoped(_valid_runs(), session)
+    try:
+        bounded_limit = max(0, min(int(limit), RECENT_LIMIT_MAX))
+    except (TypeError, ValueError):
+        bounded_limit = RECENT_LIMIT_DEFAULT
+    if bounded_limit <= 0:
         return []
-    return runs[-limit:]
+    return runs[-bounded_limit:]
 
 
 def count(session: str | None = None) -> int:
     """Number of recorded runs; session=None → whole ledger."""
-    return len(_scoped(store.read_jsonl(store.verify_path()), session))
+    return len(_scoped(_valid_runs(), session))
 
 
 def _tail_line(digest: str, width: int = 120) -> str:
@@ -160,7 +215,7 @@ def _tail_line(digest: str, width: int = 120) -> str:
     rule is "last ≤2000 chars" — so the failure preview must show the tail,
     not the head, or it is spent on banners."""
     lines = [ln.strip() for ln in digest.splitlines() if ln.strip()]
-    return lines[-1][:width] if lines else "(no output)"
+    return store.display_text(lines[-1], width) if lines else "(no output)"
 
 
 def render_entry(entry: dict) -> str:
@@ -168,7 +223,7 @@ def render_entry(entry: dict) -> str:
     status = "ok" if entry["ok"] else "FAIL"
     if entry["ok"]:
         first_line = next((ln for ln in entry["digest"].splitlines() if ln.strip()), "(no output)")
-        preview = first_line[:120]
+        preview = store.display_text(first_line, 120)
     else:
         preview = _tail_line(entry["digest"])
     nudge = (
@@ -176,14 +231,16 @@ def render_entry(entry: dict) -> str:
         if entry["ok"]
         else "Nudge: read the digest, fix the cause, then re-verify — do not claim success."
     )
-    return f"PC verify {entry['id']} · exit {entry['exit']} · {status} · {entry['ms']}ms\ndigest: {preview}\n{nudge}"
+    evidence_id = store.display_text(entry["id"], 40)
+    return f"PC verify {evidence_id} · exit {entry['exit']} · {status} · {entry['ms']}ms\ndigest: {preview}\n{nudge}"
 
 
 def render_recent(runs: list[dict], total: int) -> str:
     """Compact ledger view (ends with Nudge)."""
     lines = [f"PC evidence · last {len(runs)} of {total}"]
     for r in runs:
-        cmd = (r.get("cmd") or "")[:60]
-        lines.append(f"{r.get('id')} exit {r.get('exit')} · {r.get('ms')}ms · {cmd}")
+        cmd = store.display_text(r.get("cmd"), 60)
+        evidence_id = store.display_text(r.get("id"), 40)
+        lines.append(f"{evidence_id} exit {r.get('exit')} · {r.get('ms')}ms · {cmd}")
     lines.append("Nudge: cite evidence ids, not memory, when claiming success.")
     return "\n".join(lines)

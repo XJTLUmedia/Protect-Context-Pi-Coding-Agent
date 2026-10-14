@@ -1,5 +1,7 @@
 """Orientation digest: tree ≤2 levels, language counts, conventions files (SPEC §7)."""
 
+import subprocess
+
 from protect_context import orientation
 
 
@@ -41,3 +43,34 @@ def test_tree_limited_to_two_levels(tmp_path):
     d = orientation.digest(tmp_path)
     assert "a/ (b/, child.txt)" in d
     assert "deep.py" not in d  # level 3 never listed
+
+
+def test_orientation_sanitizes_names_caps_tree_and_does_not_follow_dir_symlinks(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("x = 1\n")
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "bad\nname.ts").write_text("export {}\n")
+    for index in range(20):
+        (tmp_path / f"file-{index:02d}.txt").write_text("x\n")
+
+    scan = orientation.scan(tmp_path)
+    rendered = orientation.digest(tmp_path)
+
+    assert len(scan["tree"]) <= orientation.MAX_TREE_ENTRIES
+    assert "bad name.ts" in rendered and "bad\nname.ts" not in rendered
+    assert "Python" not in dict(scan["languages"]), "directory symlink was traversed"
+
+
+def test_orientation_resolves_nested_start_to_git_root(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    nested = tmp_path / "packages" / "app"
+    nested.mkdir(parents=True)
+    (tmp_path / "AGENTS.md").write_text("# root instructions\n")
+    (tmp_path / "root.py").write_text("x = 1\n")
+
+    scan = orientation.scan(nested)
+
+    assert scan["root"] == tmp_path.resolve()
+    assert "AGENTS.md" in scan["conventions"]
+    assert dict(scan["languages"])["Python"] == 1

@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildBrief, sha1Hex, BRIEF_MAX_CORRECTIONS, BRIEF_MAX_LOOPS } from "../lib/brief.ts";
+import {
+  buildBrief,
+  sha1Hex,
+  selectBriefConstraints,
+  BRIEF_MAX_CORRECTIONS,
+  BRIEF_MAX_DECISIONS,
+  BRIEF_MAX_LOOPS,
+} from "../lib/brief.ts";
 import { DEFAULT_CONTRACT } from "../lib/defaults.ts";
 
 test("brief: digest is stable and hex sha1", () => {
@@ -88,6 +95,24 @@ test("brief: includes at most 3 corrections and 2 loops and last evidence", () =
   assert.ok(lines.some((l) => l.includes("[t4]")));
 });
 
+test("brief: includes at most 3 trusted decisions", () => {
+  const decisions = Array.from({ length: 5 }, (_, i) => ({
+    type: "decision",
+    text: `decision ${i}`,
+    tags: [`d${i}`],
+  })).reverse();
+  const brief = buildBrief({
+    contract: [],
+    decisions,
+    corrections: [],
+    loops: [],
+    lastEvidence: null,
+  });
+  assert.equal(brief.split("\n").filter((line) => line.startsWith("- decision ")).length, BRIEF_MAX_DECISIONS);
+  assert.ok(brief.includes("decision 4"));
+  assert.ok(!brief.includes("decision 0"));
+});
+
 test("brief: constraints beyond the 12-line cap get an overflow marker", () => {
   const extra = Array.from({ length: 3 }, (_, i) => ({
     id: `13-extra-${i}`,
@@ -124,4 +149,22 @@ test("brief: non-seed constraints carry their source tag; seed ones stay clean",
   assert.ok(brief.includes("13-owner-rule [user]: always use pnpm"));
   assert.ok(brief.includes("14-agent-rule [agent]: never touch main"));
   assert.ok(brief.includes("01-obey-instructions: Obey"), "seed constraints stay untagged");
+});
+
+test("brief: newest owner constraints outrank seeds and agent entries never displace seeds", () => {
+  const agent = Array.from({ length: 3 }, (_, i) => ({
+    id: `13-agent-${i}`,
+    text: `agent rule ${i}`,
+    added: "2026-09-03",
+    source: "agent",
+  }));
+  const owners = [
+    { id: "16-owner-old", text: "old owner rule", added: "2026-09-01", source: "user" },
+    { id: "17-owner-new", text: "new owner rule", added: "2026-09-02", source: "owner" },
+  ];
+  const selected = selectBriefConstraints([...DEFAULT_CONTRACT.constraints, ...agent, ...owners]);
+  assert.equal(selected.length, 12);
+  assert.deepEqual(selected.slice(0, 2).map((c) => c.id), ["17-owner-new", "16-owner-old"]);
+  assert.deepEqual(selected.slice(2).map((c) => c.id), DEFAULT_CONTRACT.constraints.slice(0, 10).map((c) => c.id));
+  assert.equal(selected.some((c) => c.source === "agent"), false);
 });

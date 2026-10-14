@@ -37,7 +37,30 @@ def test_budget_empty_session():
     assert b["chars"] == 0 and b["tokens_est"] == 0 and b["top"] == []
 
 
+def test_budget_ignores_malformed_field_types():
+    events = [
+        {"session": "s", "kind": "tool_result", "tool": 7, "out_chars": "huge"},
+        {"session": "s", "kind": "tool_result", "tool": "bash", "out_chars": -2},
+    ]
+    b = budget.compute(events=events, session="s")
+    assert b["chars"] == 0
+    assert b["events"] == 2
+
+
 def test_render_nudge():
     b = budget.compute(events=[], session="test-session")
     text = budget.render(b)
     assert "0 chars" in text and text.rstrip().splitlines()[-1].startswith("Nudge:")
+
+
+def test_budget_render_and_top_argument_stay_bounded():
+    events = [
+        _res(f"tool-{index}\nforged", 100 - index, session="session\nforged")
+        for index in range(12)
+    ]
+    b = budget.compute(events=events, session="session\nforged", top=10**6)
+    text = budget.render(b)
+
+    assert len(b["top"]) == 5
+    assert "session forged" in text and "\nforged" not in text
+    assert text.rstrip().splitlines()[-1].startswith("Nudge:")

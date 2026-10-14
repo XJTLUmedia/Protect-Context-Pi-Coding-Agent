@@ -31,3 +31,21 @@ def test_render_nudge_paths():
     assert bad.rstrip().splitlines()[-1].startswith("Nudge:")
     good = preflight.render({"tools": [], "git_repo": True, "missing": []})
     assert "yes" in good and "Nudge:" in good
+
+    no_repo = preflight.render({"tools": [], "git_repo": False, "missing": []})
+    assert "environment looks sane" not in no_repo
+    assert "run inside a git repository" in no_repo
+
+
+def test_preflight_tool_list_and_names_are_bounded():
+    configured = [f"missing-{index}" for index in range(30)]
+    configured[0] = "bad\nname"
+
+    res = preflight.run_preflight({"preflight_tools": configured})
+    text = preflight.render(res)
+
+    assert len(res["tools"]) == preflight.PREFLIGHT_TOOLS_MAX
+    assert res["tools"][0]["tool"] == "bad name"
+    assert res["omitted_tools"] == 10
+    assert "+10 configured entries omitted" in text
+    assert text.rstrip().splitlines()[-1].startswith("Nudge:")

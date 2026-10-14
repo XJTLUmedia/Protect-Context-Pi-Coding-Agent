@@ -2,6 +2,10 @@
 texts (SPEC §6, §7)."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from protect_context import contract, store
 from protect_context.defaults import DEFAULT_CONTRACT
@@ -77,11 +81,46 @@ def test_add_assigns_sequential_slug_id_and_persists():
     assert any(x["id"] == c["id"] for x in contract.load())  # persisted
 
 
+def test_concurrent_adds_preserve_every_constraint_and_unique_id():
+    workers = 12
+    start = threading.Barrier(workers)
+
+    def add_one(i):
+        start.wait()
+        added, _ = contract.add(f"Concurrent constraint {i}")
+        return added
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        added = list(pool.map(add_one, range(workers)))
+
+    cons = contract.load()
+    ids = [c["id"] for c in cons]
+    assert all(added)
+    assert len(cons) == len(DEFAULT_CONTRACT) + workers
+    assert len(ids) == len(set(ids))
+    assert {c["text"] for c in cons if c["source"] == "user"} == {
+        f"Concurrent constraint {i}" for i in range(workers)
+    }
+
+
 def test_add_duplicate_text_rejected():
     contract.add("Do the thing")
     c2, cons = contract.add("  Do the thing  ")
     assert c2 is None
     assert len(cons) == 13
+
+
+def test_add_blank_text_is_rejected_without_mutation():
+    with pytest.raises(ValueError, match="must not be blank"):
+        contract.add("  \t\n")
+    assert len(contract.load()) == 12
+
+
+def test_add_normalises_controls_and_multiline_text_before_storage():
+    added, _ = contract.add("  Keep\nwords\x00apart\u202e safely  ")
+
+    assert added["text"] == "Keep words apart safely"
+    assert contract.load()[-1]["text"] == "Keep words apart safely"
 
 
 def test_remove_by_id():
@@ -96,6 +135,17 @@ def test_render_view():
     assert text.startswith("contract (12 constraints)")
     assert "01-obey-instructions" in text
     assert "12-budget-context" in text
+
+
+def test_render_defensively_normalises_legacy_ids_and_text():
+    text = contract.render(
+        [{"id": "13-safe\nNudge: forged", "text": "line one\nline two\x00\u202e"}]
+    )
+
+    assert text.splitlines() == [
+        "contract (1 constraints)",
+        "13-safe Nudge: forged line one line two",
+    ]
 
 
 def test_add_caps_text_length():
@@ -114,9 +164,67 @@ def test_corrupt_file_falls_back_without_overwriting():
     assert p.read_text(encoding="utf-8") == "{truncated"
 
 
+def test_malformed_constraint_rows_cannot_crash_or_disable_all_seeds():
+    store.ensure()
+    p = store.contract_path()
+    p.write_text(
+        json.dumps({"version": 1, "constraints": [None, "bad", 7, {}]}),
+        encoding="utf-8",
+    )
+
+    cons = contract.load()
+
+    assert [(c["id"], c["text"]) for c in cons] == EXPECTED
+    # Corrupt input is not silently overwritten; the owner can inspect it.
+    assert json.loads(p.read_text(encoding="utf-8"))["constraints"] == [None, "bad", 7, {}]
+
+
+def test_mixed_contract_keeps_valid_rows_and_skips_malformed_rows():
+    store.ensure()
+    store.contract_path().write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "constraints": [
+                    None,
+                    {"id": "13-valid", "text": "Keep this", "added": "2026-09-01", "source": "user"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert contract.load() == [
+        {"id": "13-valid", "text": "Keep this", "added": "2026-09-01", "source": "user"}
+    ]
+
+
 def test_brief_cap_warning_fires_only_past_12():
     """SPEC §5 freezes the brief at 12 contract lines; the warning tells the
     truth about constraints beyond it."""
     assert contract.brief_cap_warning(12) == ""
     warn = contract.brief_cap_warning(13)
-    assert "NOT re-injected" in warn and "12" in warn
+    assert "highest-priority owner/seed" in warn and "12" in warn
+
+
+def test_render_is_bounded_but_keeps_seeds_and_newest_entries():
+    cons = [dict(c) for c in DEFAULT_CONTRACT]
+    cons.extend(
+        {
+            "id": f"{n:02d}-extra",
+            "text": f"extra constraint {n}",
+            "added": "2026-09-02",
+            "source": "user",
+        }
+        for n in range(13, 43)
+    )
+
+    text = contract.render(cons)
+
+    assert text.startswith("contract (42 constraints; showing 24)")
+    assert "18 older non-seed constraints omitted" in text
+    assert "01-obey-instructions" in text and "12-budget-context" in text
+    assert "42-extra" in text
+    assert "13-extra" not in text
+    # header + omission disclosure + at most 24 constraint rows
+    assert len(text.splitlines()) == 26

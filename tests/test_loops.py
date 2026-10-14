@@ -48,6 +48,8 @@ def test_would_block_uses_loop_block_after(write_events):
     write_events([_fail("pytest -q"), _fail("pytest -q")])
     s = loops.streaks()
     assert loops.would_block(s, cfg) == s  # 2 prior failures → 3rd identical blocked
+    assert loops.command_block("  pytest   -q ", cfg, s) == s[0]
+    assert loops.command_block("pytest -x", cfg, s) is None
 
 
 def test_verify_outcomes_feed_streaks():
@@ -97,6 +99,11 @@ def test_whitespace_variants_share_one_fingerprint(write_events):
     assert loops.streaks() == [{"cmd": "pytest -q", "count": 2}]
 
 
+def test_malformed_command_fields_are_ignored():
+    events = [_fail("pytest -q"), _fail(7), _ok(cmd={"not": "a command"})]
+    assert loops.streaks(events) == [{"cmd": "pytest -q", "count": 1}]
+
+
 def test_cross_format_parses_ts_extension_events_fixture():
     """Python parses a TS-format events.jsonl fixture string (SPEC §2 schema)."""
     fixture = (
@@ -124,3 +131,36 @@ def test_cross_format_parses_ts_extension_events_fixture():
     b = budget.compute(events, session="ext-1")
     assert b["chars"] == 3542 * 2 + 210 and b["events"] == 3
     assert b["top"] == [("bash", 3542 * 2), ("read", 210)]
+
+
+def test_cross_ledger_merge_parses_offsets_instead_of_sorting_raw_strings():
+    """An earlier TS failure must precede a later legacy Python success.
+
+    Raw string order puts ``+00:00`` before ``Z`` and would leave the failure
+    open. Parsed instant order correctly lets the later success reset it.
+    """
+    event = {
+        "ts": "2026-08-28T10:00:00.900+00:00",
+        "session": "test-session",
+        "kind": "tool_result",
+        "tool": "bash",
+        "ok": True,
+        "ms": 1,
+        "out_chars": 0,
+        "cmd": "npm test",
+        "exit": 0,
+    }
+    run = {
+        "id": "ev-0001",
+        "ts": "2026-08-28T10:00:00.100Z",
+        "session": "test-session",
+        "cmd": "npm test",
+        "exit": 1,
+        "ok": False,
+        "digest": "failed",
+        "ms": 1,
+    }
+    store.append_jsonl(store.events_path(), event)
+    store.append_jsonl(store.verify_path(), run)
+
+    assert loops.streaks() == []

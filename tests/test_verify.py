@@ -1,5 +1,6 @@
 """Verify runner: records true/false outcomes, digest rules, timeout (SPEC §7)."""
 
+import json
 import os
 import shutil
 import time
@@ -25,6 +26,12 @@ def test_false_recorded_never_raises():
     assert e["exit"] == 1
 
 
+def test_blank_command_is_rejected_without_evidence():
+    with pytest.raises(ValueError, match="must not be blank"):
+        verify.run_verify("  \t\n")
+    assert verify.count() == 0
+
+
 def test_ledger_sequence_and_ids():
     verify.run_verify("true")
     e2 = verify.run_verify("echo hello")
@@ -44,6 +51,16 @@ def test_digest_truncated_to_last_2000_chars():
     e = verify.run_verify("head -c 3000 /dev/zero | tr '\\0' 'x'")
     assert len(e["digest"]) == 2000
     assert e["digest"] == "x" * 2000
+
+
+def test_large_output_uses_bounded_tail_and_preserves_stdout_then_stderr():
+    e = verify.run_verify(
+        "head -c 200000 /dev/zero | tr '\\0' 'x'; printf 'stderr-tail' 1>&2"
+    )
+
+    assert len(e["digest"]) == verify.DIGEST_MAX
+    assert e["digest"].endswith("stderr-tail")
+    assert e["digest"] == "x" * (verify.DIGEST_MAX - len("stderr-tail")) + "stderr-tail"
 
 
 def test_timeout_recorded_as_124():
@@ -82,6 +99,27 @@ def test_recent_and_count_scope_to_session():
     assert verify.recent(1, session="someone-else")[0]["session"] == "someone-else"
 
 
+def test_recent_limit_is_clamped_and_malformed_value_is_safe():
+    for _ in range(25):
+        verify.run_verify("true")
+
+    assert len(verify.recent(10**9)) == verify.RECENT_LIMIT_MAX
+    assert verify.recent(-1) == []
+    assert len(verify.recent("not-a-number")) == verify.RECENT_LIMIT_DEFAULT  # type: ignore[arg-type]
+
+
+def test_malformed_evidence_objects_are_ignored_by_views_and_count():
+    store.ensure()
+    store.verify_path().write_text(
+        json.dumps({"session": "test-session", "ok": False}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert verify.recent() == []
+    assert verify.count() == 0
+    assert verify.run_verify("true")["id"] == "ev-0001"
+
+
 def test_timeout_clamped_to_sane_range():
     """A model-supplied timeout can never wedge the session (1–900s clamp)."""
     assert verify._clamp_timeout(10**9) == verify.TIMEOUT_MAX_S
@@ -113,6 +151,21 @@ def test_timeout_clamped_to_sane_upper_bound(monkeypatch):
     assert e["ok"] is False and e["exit"] == 124
     assert e["ms"] < 4000
     assert "timeout" in e["digest"].lower()
+
+
+def test_timeout_uses_child_kill_on_non_posix(monkeypatch):
+    class Process:
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+    process = Process()
+    monkeypatch.setattr(verify.os, "name", "nt")
+
+    verify._terminate_timed_out_process(process)
+
+    assert process.killed is True
 
 
 def _marker_alive(marker: str) -> bool:

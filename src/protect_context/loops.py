@@ -14,7 +14,28 @@ from goal #9. verify_runs.jsonl already stores `cmd`, so no §2 change.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from . import store
+
+
+def _timestamp_key(value: object, position: int) -> tuple:
+    """Chronological key for JS/Python ISO timestamps, including legacy rows.
+
+    Lexicographic ordering is wrong when one runtime wrote ``Z`` and another
+    wrote ``+00:00`` (or used a different fractional precision). Valid ISO
+    values are normalized to an instant; malformed legacy values retain a
+    deterministic, stable fallback after valid timestamps.
+    """
+    raw = str(value or "")
+    normalized = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (0, parsed.timestamp(), position)
+    except (TypeError, ValueError, OverflowError):
+        return (1, raw, position)
 
 
 def _verify_outcomes(session: str) -> list[dict]:
@@ -25,7 +46,7 @@ def _verify_outcomes(session: str) -> list[dict]:
         if r.get("session") != session or not isinstance(r.get("ok"), bool):
             continue
         cmd = r.get("cmd")
-        if not cmd:
+        if not isinstance(cmd, str) or not cmd:
             continue
         out.append(
             {
@@ -50,16 +71,20 @@ def streaks(events: list[dict] | None = None, session: str | None = None) -> lis
     """
     session = session or store.session_id()
     if events is None:
-        events = sorted(
-            store.read_jsonl(store.events_path()) + _verify_outcomes(session),
-            key=lambda e: str(e.get("ts") or ""),
-        )
+        combined = store.read_jsonl(store.events_path()) + _verify_outcomes(session)
+        events = [
+            event
+            for _position, event in sorted(
+                enumerate(combined),
+                key=lambda item: _timestamp_key(item[1].get("ts"), item[0]),
+            )
+        ]
     current: dict[str, int] = {}
     for e in events:
         if e.get("session") != session or e.get("kind") != "tool_result":
             continue
         cmd = e.get("cmd")
-        if not cmd:
+        if not isinstance(cmd, str) or not cmd:
             continue
         cmd = store.fingerprint(cmd)  # defensive: storage should be normalized
         ok = e.get("ok")
@@ -83,14 +108,27 @@ def would_block(streak_list: list[dict], cfg: dict) -> list[dict]:
     return [s for s in streak_list if s["count"] >= t]
 
 
+def command_block(command: str, cfg: dict, streak_list: list[dict] | None = None) -> dict | None:
+    """Return the matching at-threshold streak, if this command must block."""
+    fp = store.fingerprint(command)
+    if not fp:
+        return None
+    streak_list = streaks() if streak_list is None else streak_list
+    threshold = block_threshold(cfg)
+    return next(
+        (s for s in streak_list if s["cmd"] == fp and s["count"] >= threshold),
+        None,
+    )
+
+
 def render(streak_list: list[dict], cfg: dict) -> str:
-    lines = [f"PC loops · session {store.session_id()}"]
+    lines = [f"PC loops · session {store.display_text(store.session_id(), 80)}"]
     if not streak_list:
         lines.append("no repeated failing commands")
         lines.append("Nudge: before re-running a failed command, read the error and change something.")
         return "\n".join(lines)
     for s in streak_list[:5]:
-        lines.append(f"{s['cmd'][:60]} ×{s['count']}")
+        lines.append(f"{store.display_text(s['cmd'], 60)} ×{s['count']}")
     if would_block(streak_list, cfg):
         lines.append(f"next identical run will be blocked (loop_block_after={cfg.get('loop_block_after', 3)})")
         lines.append(

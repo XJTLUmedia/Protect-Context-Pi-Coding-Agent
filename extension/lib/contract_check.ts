@@ -29,6 +29,14 @@ export interface ChecklistItem {
   addressed: boolean;
 }
 
+const CHECKLIST_IDS_MAX = 24;
+
+function compactIds(items: ChecklistItem[]): string {
+  const ids = items.slice(0, CHECKLIST_IDS_MAX).map((item) => String(item.id).slice(0, 2));
+  const omitted = items.length - ids.length;
+  return `${ids.length > 0 ? ids.join(" ") : "(none)"}${omitted > 0 ? ` +${omitted} more` : ""}`;
+}
+
 /** Mark each constraint addressed/unclear from the summary text. */
 export function checkContractSummary(summary: string, contract: Contract): ChecklistItem[] {
   const hay = summary.toLowerCase();
@@ -40,11 +48,11 @@ export function checkContractSummary(summary: string, contract: Contract): Check
 
 /** Compact rendering: addressed ids grouped, unclear ids grouped, then a Nudge. */
 export function renderChecklist(items: ChecklistItem[]): string {
-  const addressed = items.filter((i) => i.addressed).map((i) => i.id.slice(0, 2));
-  const unclear = items.filter((i) => !i.addressed).map((i) => i.id.slice(0, 2));
+  const addressed = items.filter((i) => i.addressed);
+  const unclear = items.filter((i) => !i.addressed);
   const lines: string[] = [];
-  lines.push(`addressed: ${addressed.length > 0 ? addressed.join(" ") : "(none)"}`);
-  lines.push(`unclear: ${unclear.length > 0 ? unclear.join(" ") : "(none)"}`);
+  lines.push(`addressed: ${compactIds(addressed)}`);
+  lines.push(`unclear: ${compactIds(unclear)}`);
   lines.push(
     unclear.length > 0
       ? `Nudge: resolve unclear constraints (guard_contract list) or state why they don't apply.`

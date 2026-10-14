@@ -10,12 +10,13 @@ Hosts configure it via a standard .mcp.json, e.g.:
         "command": "/abs/path/.venv/bin/python",
         "args": ["-m", "protect_context.mcp_server"]}}}
 
-All 9 tools return compact text; the last line is always an actionable Nudge.
+All tools return compact text; the last line is always an actionable Nudge.
 """
 
 from __future__ import annotations
 
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from . import (
     budget,
@@ -23,6 +24,7 @@ from . import (
     diffscope,
     journal,
     loops,
+    orientation,
     preflight,
     report,
     store,
@@ -31,15 +33,46 @@ from . import (
 
 mcp = FastMCP("protect-context")
 
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_LOCAL_INITIALIZING_READ = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_LOCAL_APPEND = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+_LOCAL_MUTATION = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+_SHELL_EXECUTION = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
-@mcp.tool
+
+@mcp.tool(annotations=_LOCAL_INITIALIZING_READ)
 def guard_status() -> str:
     """Dashboard: session, diff delta, loop streaks, evidence count, contract size, last verify."""
     text, _level = report.status()
     return text
 
 
-@mcp.tool
+@mcp.tool(annotations=_SHELL_EXECUTION)
 def guard_verify(command: str, timeout_s: int = 180) -> str:
     """Run a command and RECORD the outcome as evidence (id, exit, digest) in
     verify_runs.jsonl. shell=True is by design: the command runs verbatim with
@@ -47,16 +80,28 @@ def guard_verify(command: str, timeout_s: int = 180) -> str:
     Never raises on nonzero exit; failures are recorded (that is the point).
     timeout_s is clamped to [1, 900] so a runaway value cannot wedge the host.
     """
+    if not command.strip():
+        return (
+            "PC verify · error: command must not be blank\n"
+            "Nudge: pass a concrete verification command tied to the claim."
+        )
+    blocked = loops.command_block(command, store.load_config())
+    if blocked:
+        return (
+            f"PC verify blocked · {blocked['cmd'][:80]} · "
+            f"{blocked['count']} prior failures\n"
+            "Nudge: change approach or gather new information — do not re-run unchanged."
+        )
     return verify.render_entry(verify.run_verify(command, timeout_s))
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 def guard_evidence(limit: int = 5) -> str:
     """Recent verification runs from the evidence ledger."""
     return verify.render_recent(verify.recent(limit), verify.count())
 
 
-@mcp.tool
+@mcp.tool(annotations=_LOCAL_MUTATION)
 def guard_contract(action: str, text: str | None = None, id: str | None = None) -> str:
     """Contract store: action="list" | "add" (with text) | "remove" (with id).
     Seed constraints (source="seed") cannot be removed by the model — the owner
@@ -66,9 +111,12 @@ def guard_contract(action: str, text: str | None = None, id: str | None = None) 
         return contract.render(contract.load()) + \
             "\nNudge: honor these constraints; they are re-injected whenever they change."
     if action == "add":
-        if not text:
+        if text is None:
             return "contract: 'add' requires text\nNudge: pass the constraint text to add."
-        c, cons = contract.add(text)
+        try:
+            c, cons = contract.add(text, source="agent")
+        except ValueError as e:
+            return f"contract: {e}\nNudge: pass a concrete, non-blank constraint."
         if c is None:
             return (f"contract: identical constraint already present ({len(cons)} total)\n"
                     "Nudge: reuse the existing constraint instead of duplicating it.")
@@ -92,39 +140,58 @@ def guard_contract(action: str, text: str | None = None, id: str | None = None) 
     return "contract: unknown action — use list|add|remove\nNudge: retry with a valid action."
 
 
-@mcp.tool
+@mcp.tool(annotations=_LOCAL_APPEND)
 def guard_note(type: str, text: str, tags: list[str] = []) -> str:
-    """Journal an entry: type=decision|correction|risk|note; optional tags."""
+    """Journal an agent-authored entry with a durable ``agent`` provenance tag."""
     try:
-        entry = journal.add(type, text, tags)
+        entry = journal.add(type, text, journal.tags_with_required(tags, "agent"))
     except ValueError as e:
-        return f"note: {e}\nNudge: use one of decision|correction|risk|note."
+        return f"note: {e}\nNudge: pass non-blank text and a valid journal type."
     return journal.render_ack(entry, journal.count())
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
+def guard_journal(limit: int = journal.READ_LIMIT_DEFAULT, type: str | None = None) -> str:
+    """Read recent journal entries, optionally filtered by journal type.
+
+    limit is clamped to a compact, finite range at the journal boundary.
+    """
+    try:
+        entries = journal.recent(limit, type)
+        return journal.render_recent(entries, journal.count(type), type)
+    except ValueError as e:
+        return f"journal: {e}\nNudge: pass a valid type or omit the type filter."
+
+
+@mcp.tool(annotations=_LOCAL_INITIALIZING_READ)
 def guard_loop_check() -> str:
     """Failing-command streaks for this session + change-strategy advice."""
     cfg = store.load_config()
     return loops.render(loops.streaks(), cfg)
 
 
-@mcp.tool
+@mcp.tool(annotations=_LOCAL_INITIALIZING_READ)
 def guard_diff_audit(baseline: str | None = None) -> str:
     """Diff audit vs HEAD (or a baseline ref): numstat stats + verdict vs thresholds."""
     return diffscope.render(diffscope.diff_audit(baseline))
 
 
-@mcp.tool
+@mcp.tool(annotations=_LOCAL_INITIALIZING_READ)
 def guard_preflight() -> str:
     """Tool presence/versions for configured tools + git-repo check."""
     return preflight.render(preflight.run_preflight())
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 def guard_budget() -> str:
     """Session tool-output chars, estimated tokens (chars/4), top-5 tools."""
     return budget.render(budget.compute())
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def guard_orientation() -> str:
+    """Bounded repository tree, language counts, and conventions files."""
+    return orientation.digest()
 
 
 def main() -> None:

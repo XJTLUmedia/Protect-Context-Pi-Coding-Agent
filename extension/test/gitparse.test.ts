@@ -1,6 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseNumstat, parseShortstat, diffVerdict } from "../lib/gitparse.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  diffVerdict,
+  parseNumstat,
+  parseShortstat,
+  parseUntrackedPaths,
+  scanUntrackedFiles,
+} from "../lib/gitparse.ts";
 
 const NUMSTAT_FIXTURE = [
   "12\t3\tsrc/a.py",
@@ -48,4 +57,39 @@ test("verdict: ok / warn / hard levels against thresholds", () => {
   assert.equal(diffVerdict(100, 10, t).level, "warn", "file-count warn");
   assert.equal(diffVerdict(800, 2, t).level, "hard");
   assert.equal(diffVerdict(900, 2, t).level, "hard");
+});
+
+test("untracked paths: porcelain -z parser accepts only Git-selected ?? records", () => {
+  const out =
+    "?? src/new.ts\0!! ignored.log\0 M tracked.ts\0?? name with\nnewline.txt\0" +
+    "?? .agent-guard/state.json\0?? .agent-guard\\events.jsonl\0";
+  assert.deepEqual(parseUntrackedPaths(out), ["name with\nnewline.txt", "src/new.ts"]);
+});
+
+test("untracked paths: nested cwd excludes only its exact active store", () => {
+  const out =
+    "?? .agent-guard/root-state.json\0" +
+    "?? packages/app/.agent-guard/state.json\0" +
+    "?? packages/other/.agent-guard/user-file.txt\0";
+
+  assert.deepEqual(parseUntrackedPaths(out, "packages/app/.agent-guard"), [
+    ".agent-guard/root-state.json",
+    "packages/other/.agent-guard/user-file.txt",
+  ]);
+});
+
+test("untracked scan: counts bounded text lines and does not treat binary content as lines", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pc-untracked-"));
+  try {
+    writeFileSync(join(dir, "text.txt"), "one\ntwo", "utf8");
+    writeFileSync(join(dir, "binary.bin"), Buffer.from([0, 10, 10]));
+    const scan = scanUntrackedFiles(dir, ["text.txt", "binary.bin", "missing.txt"], 800);
+    assert.equal(scan.files, 3, "file count follows Git's exact path set");
+    assert.equal(scan.lines, 2);
+    assert.equal(scan.binaryFiles, 1);
+    assert.equal(scan.skippedFiles, 1);
+    assert.equal(scan.scanLimited, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -19,11 +19,23 @@ def compute(events: list[dict] | None = None, session: str | None = None, top: i
         if e.get("session") != session or e.get("kind") != "tool_result":
             continue
         n += 1
-        chars = e.get("out_chars") or 0
-        tool = e.get("tool") or "unknown"
+        raw_chars = e.get("out_chars")
+        chars = (
+            raw_chars
+            if isinstance(raw_chars, int)
+            and not isinstance(raw_chars, bool)
+            and raw_chars >= 0
+            else 0
+        )
+        raw_tool = e.get("tool")
+        tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "unknown"
         per_tool[tool] = per_tool.get(tool, 0) + chars
     chars = sum(per_tool.values())
-    top_tools = sorted(per_tool.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+    try:
+        bounded_top = max(0, min(int(top), 5))
+    except (TypeError, ValueError):
+        bounded_top = 5
+    top_tools = sorted(per_tool.items(), key=lambda kv: (-kv[1], kv[0]))[:bounded_top]
     return {
         "session": session,
         "chars": chars,
@@ -34,9 +46,11 @@ def compute(events: list[dict] | None = None, session: str | None = None, top: i
 
 
 def render(b: dict) -> str:
-    top = " · ".join(f"{t}={c}" for t, c in b["top"]) or "none"
+    top = " · ".join(
+        f"{store.display_text(t, 40) or 'unknown'}={c}" for t, c in b["top"][:5]
+    ) or "none"
     return (
-        f"PC budget · session {b['session']}\n"
+        f"PC budget · session {store.display_text(b['session'], 80)}\n"
         f"tool output: {b['chars']} chars (~{b['tokens_est']} tokens est) over {b['events']} tool results\n"
         f"top: {top}\n"
         "Nudge: keep tool outputs bounded (head/tail/digest); use targeted reads, not whole-file dumps."

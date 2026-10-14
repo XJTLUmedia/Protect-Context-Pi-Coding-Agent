@@ -1,12 +1,13 @@
-"""fastmcp in-memory Client smoke over ALL 9 MCP tools (SPEC §4, §7)."""
+"""fastmcp in-memory Client smoke over every shipped MCP tool."""
 
 import asyncio
 import json
 import re
+import subprocess
 
 import pytest
 
-from protect_context import store
+from protect_context import contract, store
 
 fastmcp = pytest.importorskip("fastmcp")
 
@@ -16,10 +17,26 @@ EXPECTED_TOOLS = {
     "guard_evidence",
     "guard_contract",
     "guard_note",
+    "guard_journal",
     "guard_loop_check",
     "guard_diff_audit",
     "guard_preflight",
     "guard_budget",
+    "guard_orientation",
+}
+
+READ_ONLY_TOOLS = {
+    "guard_evidence",
+    "guard_journal",
+    "guard_budget",
+    "guard_orientation",
+}
+
+INITIALIZING_READ_TOOLS = {
+    "guard_status",
+    "guard_loop_check",
+    "guard_diff_audit",
+    "guard_preflight",
 }
 
 
@@ -27,7 +44,7 @@ def _text(res) -> str:
     return res.content[0].text
 
 
-def test_all_nine_tools_smoke():
+def test_all_tools_smoke():
     from fastmcp import Client
 
     from protect_context.mcp_server import mcp
@@ -52,11 +69,15 @@ def test_all_nine_tools_smoke():
             results["note"] = _text(await client.call_tool(
                 "guard_note", {"type": "correction", "text": "use rg not grep",
                                "tags": ["search"]}))
+            results["journal"] = _text(await client.call_tool(
+                "guard_journal", {"limit": 5, "type": "correction"}))
             results["loop_check"] = _text(await client.call_tool("guard_loop_check", {}))
             results["diff_audit"] = _text(
                 await client.call_tool("guard_diff_audit", {"baseline": None}))
             results["preflight"] = _text(await client.call_tool("guard_preflight", {}))
             results["budget"] = _text(await client.call_tool("guard_budget", {}))
+            results["orientation"] = _text(
+                await client.call_tool("guard_orientation", {}))
             return results
 
     res = asyncio.run(run())
@@ -72,6 +93,8 @@ def test_all_nine_tools_smoke():
     # contract add returned the new id; remove it to prove remove works too
     m = re.search(r"added (\d{2}-[\w-]+)", res["contract_add"])
     assert m, res["contract_add"]
+    added = next(c for c in contract.load() if c["id"] == m.group(1))
+    assert added["source"] == "agent"
 
     async def cleanup():
         from fastmcp import Client
@@ -88,7 +111,104 @@ def test_all_nine_tools_smoke():
     # note actually persisted to the shared journal
     entries = store.read_jsonl(store.journal_path())
     assert entries and entries[-1]["type"] == "correction"
-    assert json.loads(json.dumps(entries[-1]["tags"])) == ["search"]
+    assert json.loads(json.dumps(entries[-1]["tags"])) == ["search", "agent"]
+    assert "use rg not grep" in res["journal"]
+    assert "[search,agent]" in res["journal"]
+    assert "PC orientation" in res["orientation"]
+
+
+def test_tool_annotations_describe_reads_and_side_effects():
+    from fastmcp import Client
+
+    from protect_context.mcp_server import mcp
+
+    async def run():
+        async with Client(mcp) as client:
+            return {tool.name: tool for tool in await client.list_tools()}
+
+    tools = asyncio.run(run())
+    for name in READ_ONLY_TOOLS:
+        annotations = tools[name].annotations
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
+
+    for name in INITIALIZING_READ_TOOLS:
+        annotations = tools[name].annotations
+        assert annotations.readOnlyHint is False
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
+
+    verify_annotations = tools["guard_verify"].annotations
+    assert verify_annotations.readOnlyHint is False
+    assert verify_annotations.destructiveHint is True
+    assert verify_annotations.idempotentHint is False
+    assert verify_annotations.openWorldHint is True
+
+    note_annotations = tools["guard_note"].annotations
+    assert note_annotations.readOnlyHint is False
+    assert note_annotations.destructiveHint is False
+    assert note_annotations.openWorldHint is False
+
+    contract_annotations = tools["guard_contract"].annotations
+    assert contract_annotations.readOnlyHint is False
+    assert contract_annotations.destructiveHint is True
+    assert contract_annotations.openWorldHint is False
+
+
+def test_read_only_annotated_tools_do_not_create_store_in_fresh_repo():
+    from fastmcp import Client
+
+    from protect_context.mcp_server import mcp
+
+    subprocess.run(["git", "init", "-q"], check=True, capture_output=True)
+    assert not store.guard_dir().exists()
+
+    async def run():
+        async with Client(mcp) as client:
+            for name in sorted(READ_ONLY_TOOLS):
+                result = _text(await client.call_tool(name, {}))
+                assert "Nudge:" in result
+
+    asyncio.run(run())
+    assert not store.guard_dir().exists()
+
+
+def test_guard_note_validation_and_guard_journal_bounds():
+    from fastmcp import Client
+
+    from protect_context import journal
+    from protect_context.mcp_server import mcp
+
+    async def run():
+        async with Client(mcp) as client:
+            blank = _text(await client.call_tool(
+                "guard_note", {"type": "note", "text": "\n\t\x00"}))
+            for i in range(journal.READ_LIMIT_MAX + 3):
+                await client.call_tool("guard_note", {
+                    "type": "decision", "text": f"bounded entry {i}",
+                    "tags": ["x" * 100] * 20,
+                })
+            view = _text(await client.call_tool(
+                "guard_journal", {"limit": 9999, "type": "decision"}))
+            invalid = _text(await client.call_tool(
+                "guard_journal", {"limit": 5, "type": "invalid"}))
+            return blank, view, invalid
+
+    blank, view, invalid = asyncio.run(run())
+    assert "must not be blank" in blank and "Nudge:" in blank
+    assert f"last {journal.READ_LIMIT_MAX} of {journal.READ_LIMIT_MAX + 3}" in view
+    assert "bounded entry 0" not in view and "bounded entry 22" in view
+    assert "agent" in view
+    assert view.rstrip().splitlines()[-1].startswith("Nudge:")
+    assert "unknown journal type" in invalid and "Nudge:" in invalid
+
+    entries = store.read_jsonl(store.journal_path())
+    assert entries[-1]["tags"].count("agent") == 1
+    assert entries[-1]["tags"][-1] == "agent"
+    assert len(entries[-1]["tags"]) <= journal.TAG_COUNT_CAP
 
 
 def test_failed_guard_verify_feeds_loop_streak_at_mcp_boundary():
@@ -116,6 +236,27 @@ def test_failed_guard_verify_feeds_loop_streak_at_mcp_boundary():
     assert "false ×2" in loop
     assert "next identical run will be blocked" in loop
     assert "Nudge:" in loop
+
+
+def test_third_identical_mcp_verify_is_blocked_without_new_evidence():
+    from fastmcp import Client
+
+    from protect_context import verify
+    from protect_context.mcp_server import mcp
+
+    async def run():
+        async with Client(mcp) as client:
+            first = _text(await client.call_tool("guard_verify", {"command": "false"}))
+            second = _text(await client.call_tool("guard_verify", {"command": "false"}))
+            third = _text(await client.call_tool("guard_verify", {"command": "false"}))
+            blank = _text(await client.call_tool("guard_verify", {"command": "  \t"}))
+            return first, second, third, blank
+
+    first, second, third, blank = asyncio.run(run())
+    assert "ev-0001" in first and "ev-0002" in second
+    assert "PC verify blocked" in third and "Nudge:" in third
+    assert "must not be blank" in blank and "Nudge:" in blank
+    assert verify.count() == 2
 
 
 def test_guard_verify_never_raises_on_bad_command():

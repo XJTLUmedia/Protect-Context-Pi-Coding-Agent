@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { failedAttempts, openLoops, openLoopsFromMap, shouldBlockLoop, loopBlockReason } from "../lib/loops.ts";
+import {
+  failedAttempts,
+  failedAttemptsFromLedgers,
+  openLoops,
+  openLoopsFromMap,
+  shouldBlockLoop,
+  loopBlockReason,
+} from "../lib/loops.ts";
 import { toolResultEvent, toolCallEvent } from "../lib/events.ts";
+import type { VerifyRun } from "../lib/verify.ts";
 
 function ev(session: string, cmd: string, ok: boolean, exit: number): ReturnType<typeof toolResultEvent> {
   return toolResultEvent(session, "bash", { ok, ms: 10, outChars: 5, cmd, exit });
@@ -89,4 +97,55 @@ test("loops: openLoopsFromMap mirrors openLoops on the failedAttempts map", () =
   // a success reset in the map clears it too
   map.delete("a");
   assert.equal(openLoopsFromMap(map, 3).length, 0);
+});
+
+test("loops: restart reconstruction merges same-session bash events and verify ledger chronologically", () => {
+  const events = [ev(S, "npm test", false, 1)];
+  events[0]!.ts = "2026-09-01T00:00:01.000Z";
+  const run = (over: Partial<VerifyRun>): VerifyRun => ({
+    id: "ev-0001",
+    ts: "2026-09-01T00:00:02.000Z",
+    session: S,
+    cmd: "npm test",
+    exit: 1,
+    ok: false,
+    digest: "",
+    ms: 1,
+    ...over,
+  });
+  const map = failedAttemptsFromLedgers(events, [run({}), run({ session: "other" })], S);
+  assert.equal(map.get("npm test")?.failures, 2, "both ledgers contribute, other session does not");
+
+  const reset = failedAttemptsFromLedgers(events, [run({ ok: true, exit: 0 })], S);
+  assert.equal(reset.has("npm test"), false, "later verify success resets earlier bash failure");
+});
+
+test("loops: cross-runtime ISO offsets are ordered as instants, not raw strings", () => {
+  const events = [ev(S, "npm test", true, 0)];
+  events[0]!.ts = "2026-09-01T00:00:00.900+00:00";
+  const earlierFailure: VerifyRun = {
+    id: "ev-0001",
+    ts: "2026-09-01T00:00:00.100Z",
+    session: S,
+    cmd: "npm test",
+    exit: 1,
+    ok: false,
+    digest: "",
+    ms: 1,
+  };
+
+  const map = failedAttemptsFromLedgers(events, [earlierFailure], S);
+
+  assert.equal(map.has("npm test"), false, "later success resets the earlier failure");
+});
+
+test("loops: malformed persisted command fields are ignored defensively", () => {
+  const malformed = [
+    { kind: "tool_result", session: S, cmd: 7, ok: false, exit: 1, ts: null },
+    { kind: "tool_result", session: S, cmd: "valid", ok: false, exit: 1, ts: "bad" },
+  ] as any;
+
+  const map = failedAttemptsFromLedgers(malformed, [], S);
+
+  assert.deepEqual([...map.keys()], ["valid"]);
 });

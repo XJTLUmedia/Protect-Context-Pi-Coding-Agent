@@ -6,11 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "protect-context"
 version = "1.0.0"
 description = "protect-context agent guardrail suite: shared store, MCP server (fastmcp), CLI"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["fastmcp>=3,<4"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "build>=1,<2"]
 
 [project.scripts]
 protect-context = "protect_context.cli:main"
