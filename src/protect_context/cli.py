@@ -68,7 +68,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     blocked = loops.command_block(args.command, cfg)
     if blocked:
         print(
-            f"PC verify blocked · {blocked['cmd'][:80]} · "
+            f"PC verify blocked · {store.display_text(blocked['cmd'], 80)} · "
             f"{blocked['count']} prior failures"
         )
         print("Nudge: change approach or gather new information — do not re-run unchanged.")
@@ -92,6 +92,10 @@ def cmd_contract(args: argparse.Namespace) -> int:
     if args.action == "add":
         try:
             c, cons = contract.add(args.text)
+        except contract.ContractIntegrityError as e:
+            print(f"contract: {e}")
+            print("Nudge: repair or restore the contract file, then retry the mutation.")
+            return 2
         except ValueError as e:
             print(f"contract: {e}")
             print("Nudge: pass a concrete, non-blank constraint.")
@@ -108,12 +112,19 @@ def cmd_contract(args: argparse.Namespace) -> int:
         print("Nudge: keep the contract tight — fewer, sharper constraints survive re-injection.")
         return 0
     if args.action == "remove":
-        if contract.remove(args.id):
-            print(f"removed {args.id}")
+        try:
+            removed = contract.remove(args.id)
+        except contract.ContractIntegrityError as e:
+            print(f"contract: {e}")
+            print("Nudge: repair or restore the contract file, then retry the mutation.")
+            return 2
+        safe_id = store.display_text(args.id, contract.RENDER_ID_MAX)
+        if removed:
+            print(f"removed {safe_id}")
             print(contract.render(contract.load()))
             print("Nudge: keep the contract tight — fewer, sharper constraints survive re-injection.")
             return 0
-        print(f"no constraint with id {args.id!r}")
+        print(f"no constraint with id {safe_id!r}")
         print("Nudge: run 'contract list' to see current ids.")
         return 2
     print(NUDGE_ERROR)
@@ -155,7 +166,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_preflight(args: argparse.Namespace) -> int:
     res = preflight.run_preflight()
     print(preflight.render(res))
-    return 1 if (res["missing"] or not res["git_repo"] or res.get("omitted_tools")) else 0
+    return 1 if (
+        res["missing"]
+        or not res["git_repo"]
+        or res.get("omitted_tools")
+        or res.get("probe_issues")
+    ) else 0
 
 
 def cmd_budget(args: argparse.Namespace) -> int:

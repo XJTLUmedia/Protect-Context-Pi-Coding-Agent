@@ -17,7 +17,6 @@ import {
   lstatSync,
   unlinkSync,
   rmSync,
-  rmdirSync,
   realpathSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -69,6 +68,7 @@ export const STORE_LOCK_TIMEOUT_MS = 5_000;
 export const STORE_LOCK_RETRY_MS = 25;
 const LOCK_DIR_NAME = ".lock.d";
 const LOCK_OWNER_NAME = "owner.json";
+const LOCK_REAP_MARKER_NAME = ".reap-marker";
 const LOCK_RENAME_TIMEOUT_MS = 1_000;
 const LOCK_RENAME_RETRY_MS = 5;
 
@@ -181,11 +181,24 @@ function sameSnapshot(left: LockSnapshot, right: LockSnapshot): boolean {
     && left.owner?.token === right.owner?.token;
 }
 
-function reapClaimPath(lockDir: string, owner: LockOwner | null): string {
-  const key = owner === null
-    ? "unowned"
-    : createHash("sha256").update(owner.token).digest("hex").slice(0, 20);
-  return `${lockDir}.reap.${key}`;
+function staleTombPath(lockDir: string, snapshot: LockSnapshot): string {
+  const token = snapshot.owner?.token ?? "unowned";
+  const material = `${snapshot.identity.dev}:${snapshot.identity.ino}:${token}`;
+  const key = createHash("sha256").update(material).digest("hex").slice(0, 24);
+  return `${lockDir}.stale.${key}`;
+}
+
+function markStaleLock(lockDir: string): boolean {
+  try {
+    writeFileSync(join(lockDir, LOCK_REAP_MARKER_NAME), "protect-context stale lease quarantine\n", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") return true;
+    return false;
+  }
 }
 
 function oldEnoughToReap(lockDir: string, staleMs: number): boolean {
@@ -204,50 +217,30 @@ function breakStaleLock(lockDir: string, staleMs: number): boolean {
   if (!oldEnoughToReap(lockDir, staleMs)) return false;
   const observed = lockSnapshot(lockDir);
   if (observed === null || !snapshotIsStale(observed, staleMs)) return false;
-  const claim = reapClaimPath(lockDir, observed.owner);
+  const tomb = staleTombPath(lockDir, observed);
+  if (existsSync(tomb) || !markStaleLock(lockDir)) return false;
+
+  // Adding the marker refreshes mtime. The original snapshot was already
+  // age/liveness checked, so only identity and owner must remain unchanged.
+  const current = lockSnapshot(lockDir);
+  if (current === null || !sameSnapshot(observed, current)) return false;
   try {
-    mkdirSync(claim);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") return false;
+    renameLease(lockDir, tomb);
+  } catch {
     return false;
   }
-
-  try {
-    const current = lockSnapshot(lockDir);
-    if (current === null || !sameSnapshot(observed, current) || !snapshotIsStale(current, staleMs)) {
-      return false;
-    }
-
-    const tomb = `${lockDir}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
+  const moved = lockSnapshot(tomb);
+  if (moved === null || !sameSnapshot(current, moved)) {
     try {
-      renameLease(lockDir, tomb);
+      if (!existsSync(lockDir)) renameLease(tomb, lockDir);
     } catch {
-      return false;
+      // Do not delete an object whose identity could not be verified.
     }
-    const moved = lockSnapshot(tomb);
-    if (moved === null || !sameSnapshot(current, moved)) {
-      try {
-        if (!existsSync(lockDir)) renameLease(tomb, lockDir);
-      } catch {
-        // Do not delete an object whose identity could not be verified.
-      }
-      return false;
-    }
-    try {
-      rmSync(tomb, { recursive: true, force: true });
-    } catch {
-      // The authoritative lock name is already free. A unique quarantine is
-      // safer than restoring a partly removed stale directory.
-    }
-    return true;
-  } finally {
-    try {
-      rmdirSync(claim);
-    } catch {
-      // A failed claim cleanup can delay future stale recovery, but it must
-      // never authorize deletion of an unknown lock.
-    }
+    return false;
   }
+  // The non-empty tomb is deliberately retained as a durable guard against a
+  // delayed breaker moving a replacement lease after this process exits.
+  return true;
 }
 
 function releaseStoreLock(lockDir: string, token: string): void {

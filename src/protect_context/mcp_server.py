@@ -88,7 +88,7 @@ def guard_verify(command: str, timeout_s: int = 180) -> str:
     blocked = loops.command_block(command, store.load_config())
     if blocked:
         return (
-            f"PC verify blocked · {blocked['cmd'][:80]} · "
+            f"PC verify blocked · {store.display_text(blocked['cmd'], 80)} · "
             f"{blocked['count']} prior failures\n"
             "Nudge: change approach or gather new information — do not re-run unchanged."
         )
@@ -115,6 +115,8 @@ def guard_contract(action: str, text: str | None = None, id: str | None = None) 
             return "contract: 'add' requires text\nNudge: pass the constraint text to add."
         try:
             c, cons = contract.add(text, source="agent")
+        except contract.ContractIntegrityError as e:
+            return f"contract: {e}\nNudge: repair or restore the contract file, then retry the mutation."
         except ValueError as e:
             return f"contract: {e}\nNudge: pass a concrete, non-blank constraint."
         if c is None:
@@ -127,15 +129,18 @@ def guard_contract(action: str, text: str | None = None, id: str | None = None) 
     if action == "remove":
         if not id:
             return "contract: 'remove' requires id\nNudge: run action=\"list\" to see current ids."
-        target = next((c for c in contract.load() if c.get("id") == id), None)
-        if target is None:
-            return (f"contract: no constraint with id {id!r}\n"
-                    "Nudge: run action=\"list\" to see current ids.")
-        if target.get("source") == "seed":
-            return (f"contract: {id} is a seed constraint — model-driven removal is refused\n"
+        safe_id = store.display_text(id, contract.RENDER_ID_MAX)
+        try:
+            removed = contract.remove(id, allow_seed=False)
+        except contract.ContractIntegrityError as e:
+            return f"contract: {e}\nNudge: repair or restore the contract file, then retry the mutation."
+        except contract.SeedConstraintRemovalError:
+            return (f"contract: {safe_id} is a seed constraint — model-driven removal is refused\n"
                     "Nudge: only the owner may remove it (CLI `contract remove ID` or /guard-contract remove).")
-        contract.remove(id)
-        return (f"removed {id}\n" + contract.render(contract.load()) +
+        if not removed:
+            return (f"contract: no constraint with id {safe_id!r}\n"
+                    "Nudge: run action=\"list\" to see current ids.")
+        return (f"removed {safe_id}\n" + contract.render(contract.load()) +
                 "\nNudge: keep the contract tight — fewer, sharper constraints survive re-injection.")
     return "contract: unknown action — use list|add|remove\nNudge: retry with a valid action."
 

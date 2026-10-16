@@ -11,6 +11,13 @@ import { normalizeOneLine } from "./text.ts";
 export const TEXT_CAP = 500;
 export const CONTRACT_RENDER_MAX = 24;
 
+export class ContractIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ContractIntegrityError";
+  }
+}
+
 /**
  * Load the contract, seeding `.agent-guard/contract.json` from DEFAULT_CONTRACT
  * only when the file does not exist. A corrupt/unreadable file falls back to
@@ -34,7 +41,7 @@ function isConstraint(value: unknown): value is Constraint {
 }
 
 /** Caller must hold the shared store lease. */
-function loadContractUnlocked(cwd: string): Contract {
+function loadContractUnlocked(cwd: string, forMutation = false): Contract {
   const file = contractPath(cwd);
   if (!existsSync(file)) {
     const seeded = cloneDefaultContract();
@@ -45,10 +52,20 @@ function loadContractUnlocked(cwd: string): Contract {
   if (existing && typeof existing === "object" && Array.isArray((existing as { constraints?: unknown }).constraints)) {
     const rows = (existing as { constraints: unknown[] }).constraints;
     const constraints = rows.filter(isConstraint);
+    if (forMutation && constraints.length !== rows.length) {
+      throw new ContractIntegrityError(
+        "contract contains malformed rows; repair .agent-guard/contract.json before mutating it",
+      );
+    }
     // A non-empty list with no valid records is effectively corrupt. Serve
     // frozen seeds in memory, but never overwrite the owner's damaged file.
     if (rows.length > 0 && constraints.length === 0) return cloneDefaultContract();
     return { version: 1, constraints };
+  }
+  if (forMutation) {
+    throw new ContractIntegrityError(
+      "contract file is malformed; repair .agent-guard/contract.json before mutating it",
+    );
   }
   return cloneDefaultContract();
 }
@@ -86,7 +103,7 @@ export function addConstraintWithStatus(cwd: string, text: string, source = "age
   const cleanText = normalizeOneLine(text, TEXT_CAP);
   if (cleanText === "") throw new Error("constraint text must not be blank");
   return withStoreLock(storeDir(cwd), () => {
-    const contract = loadContractUnlocked(cwd);
+    const contract = loadContractUnlocked(cwd, true);
     const existing = contract.constraints.find((constraint) => normalizeOneLine(constraint.text, TEXT_CAP) === cleanText);
     if (existing) return { constraint: existing, added: false, total: contract.constraints.length };
     const constraint: Constraint = {
@@ -107,7 +124,7 @@ export function addConstraint(cwd: string, text: string, source = "agent"): Cons
 
 export function removeConstraint(cwd: string, id: string): boolean {
   return withStoreLock(storeDir(cwd), () => {
-    const contract = loadContractUnlocked(cwd);
+    const contract = loadContractUnlocked(cwd, true);
     const before = contract.constraints.length;
     contract.constraints = contract.constraints.filter((c) => c.id !== id);
     if (contract.constraints.length === before) return false;

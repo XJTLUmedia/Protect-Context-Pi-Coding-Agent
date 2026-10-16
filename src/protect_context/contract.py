@@ -25,6 +25,14 @@ RENDER_MAX_CONSTRAINTS = 24
 _CONTROL_CATEGORIES = {"Cc", "Cf", "Cs"}
 
 
+class ContractIntegrityError(ValueError):
+    """Raised when mutating would overwrite unreadable owner contract data."""
+
+
+class SeedConstraintRemovalError(ValueError):
+    """Raised when an agent surface attempts to remove a frozen seed."""
+
+
 def _normalise_text(value: object, cap: int) -> str:
     """Return bounded single-line text safe for storage and rendering."""
     raw = str(value or "")
@@ -75,6 +83,34 @@ def _load_unlocked() -> list[dict]:
     return valid
 
 
+def _load_for_mutation_unlocked() -> list[dict]:
+    """Load only a fully valid contract for read-modify-write operations.
+
+    Read surfaces may conservatively filter/fall back around damaged legacy
+    rows. A mutation is different: saving that filtered view would silently
+    erase the owner's unreadable data, so it must fail closed instead.
+    """
+    p = store.contract_path()
+    if not p.exists():
+        return _load_unlocked()
+    data = store.read_json(p)
+    if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
+        raise ContractIntegrityError(
+            "contract file is malformed; repair .agent-guard/contract.json before mutating it"
+        )
+    raw = data["constraints"]
+    required = ("id", "text", "added", "source")
+    if any(
+        not isinstance(row, dict)
+        or not all(isinstance(row.get(key), str) for key in required)
+        for row in raw
+    ):
+        raise ContractIntegrityError(
+            "contract contains malformed rows; repair .agent-guard/contract.json before mutating it"
+        )
+    return [dict(row) for row in raw]
+
+
 def load() -> list[dict]:
     """Load the current contract.
 
@@ -113,7 +149,7 @@ def add(text: str, source: str = "user") -> tuple[dict | None, list[dict]]:
     if not text:
         raise ValueError("constraint text must not be blank")
     with store.store_lock():
-        cons = _load_unlocked()
+        cons = _load_for_mutation_unlocked()
         for c in cons:
             if _normalise_text(c.get("text"), MAX_TEXT) == text:
                 return None, cons
@@ -136,13 +172,23 @@ def add(text: str, source: str = "user") -> tuple[dict | None, list[dict]]:
         return constraint, cons
 
 
-def remove(cid: str) -> bool:
-    """Remove a constraint by exact id. Returns False if not found."""
+def remove(cid: str, *, allow_seed: bool = True) -> bool:
+    """Remove a constraint by exact id. Returns False if not found.
+
+    ``allow_seed=False`` performs the provenance check inside the same lock as
+    the write, so a concurrent replacement cannot bypass an agent surface's
+    frozen-seed protection.
+    """
     with store.store_lock():
-        cons = _load_unlocked()
-        kept = [c for c in cons if c.get("id") != cid]
-        if len(kept) == len(cons):
+        cons = _load_for_mutation_unlocked()
+        targets = [c for c in cons if c.get("id") == cid]
+        if not targets:
             return False
+        if not allow_seed and any(c.get("source") == "seed" for c in targets):
+            raise SeedConstraintRemovalError(
+                "seed constraint removal is refused on agent-driven surfaces"
+            )
+        kept = [c for c in cons if c.get("id") != cid]
         _save_unlocked(kept)
         return True
 

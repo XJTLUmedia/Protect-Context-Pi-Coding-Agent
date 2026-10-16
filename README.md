@@ -178,7 +178,9 @@ Numeric thresholds may be set to zero; the extension records an explicit first
 notification so a zero watermark does not silently disable alerts. Preflight
 checks at most 20 configured tool entries. If more are configured, it lists the
 omitted count and returns a warning instead of claiming the environment is
-fully checked.
+fully checked. Version probes have a two-second per-tool timeout, share a
+15-second overall deadline, and decode at most 4 KiB of output; a missing
+version is reported as an incomplete preflight.
 
 ## Shared store and concurrency
 
@@ -199,7 +201,10 @@ The lease follows the atomic `mkdir` design used by mature lock libraries while
 remaining dependency-free and interoperable with Python. A crashed same-host
 owner is reclaimable after the stale interval; a stale foreign-host owner fails
 closed because process liveness cannot be proved safely without an external
-coordinator.
+coordinator. Recovery retains a small identity-bound `.lock.d.stale.*`
+directory as a durable race guard; it does not block new writers and lives
+inside the already-ignored runtime store. Contract mutations also fail closed
+when owner rows are malformed, preserving the original file for repair.
 
 ## Validation
 
@@ -229,9 +234,10 @@ test instead of leaving stale numbers in this README.
 - An evidence record proves only that one command returned one exit code. It is
   not cryptographically bound to a commit/worktree, has no freshness policy,
   and does not prove the claimed behavior.
-- The default diff baseline is `HEAD`; committing mid-task resets that view.
-  Pass an explicit baseline to the CLI/MCP audit for cross-commit scope.
-  Binary files count as files but zero lines.
+- The pi extension freezes its diff baseline at session start, so committing
+  mid-session does not reset its scope. CLI/MCP audits default to current
+  `HEAD`; pass them an explicit baseline for cross-commit scope. Binary files
+  count as files but zero lines.
 - Untracked-file content reads are capped at 1,000 files, 1 MB per file, and
   8 MB total, and stop once the hard line threshold is known. Output explicitly
   reports a bounded scan, promotes it to at least a warning/CLI exit 1, and

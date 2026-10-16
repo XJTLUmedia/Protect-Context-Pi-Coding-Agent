@@ -44,7 +44,7 @@ STORE_LOCK_STALE_S = 30.0
 STORE_LOCK_TIMEOUT_S = 5.0
 STORE_LOCK_RETRY_S = 0.025
 _LEASE_OWNER = "owner.json"
-_LEASE_REAP_PREFIX = ".lock.d.reap."
+_LEASE_REAP_MARKER = ".reap-marker"
 _LEASE_RENAME_TIMEOUT_S = 1.0
 _LEASE_RENAME_RETRY_S = 0.005
 _STORE_LOCK_LOCAL = threading.local()
@@ -331,12 +331,32 @@ def _same_snapshot(
     return left[0] == right[0] and _owner_token(left[2]) == _owner_token(right[2])
 
 
-def _reap_claim_path(path: Path, owner: dict | None) -> Path:
-    token = _owner_token(owner)
-    key = (
-        "unowned" if token is None else hashlib.sha256(token.encode()).hexdigest()[:20]
-    )
-    return path.with_name(f"{_LEASE_REAP_PREFIX}{key}")
+def _stale_tomb_path(
+    path: Path, snapshot: tuple[tuple[int, int], float, dict | None]
+) -> Path:
+    """Return the immutable quarantine name for one exact lease identity.
+
+    The identity-derived name is deliberately stable across Python and Node.
+    Keeping the non-empty quarantine in place makes it a filesystem-level
+    guard against a delayed stale breaker renaming a replacement lease.
+    """
+    (device, inode), _mtime, owner = snapshot
+    material = f"{device}:{inode}:{_owner_token(owner) or 'unowned'}"
+    key = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return path.with_name(f"{path.name}.stale.{key}")
+
+
+def _mark_stale_lease(path: Path) -> bool:
+    """Make a stale lease non-empty before it is moved to quarantine."""
+    marker = path / _LEASE_REAP_MARKER
+    try:
+        with open(marker, "x", encoding="utf-8") as value:
+            value.write("protect-context stale lease quarantine\n")
+    except FileExistsError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _old_enough_to_reap(path: Path, stale_s: float) -> bool:
@@ -367,61 +387,45 @@ def _rename_lease(source: Path, destination: Path) -> None:
 
 
 def _break_stale_lease(path: Path, stale_s: float) -> bool:
-    """Atomically quarantine and remove the exact stale directory inspected.
+    """Atomically quarantine the exact stale directory inspected.
 
-    A token-scoped sibling claim serializes concurrent stale breakers. The
-    lease is then re-read under that claim before rename, so a newly acquired
-    replacement is never deleted based on an observation of its predecessor.
+    The quarantine path is deterministic for the observed directory identity
+    and is intentionally retained.  It therefore doubles as a durable claim:
+    even if a breaker is paused or killed, a delayed peer cannot rename a
+    replacement ``.lock.d`` over the non-empty quarantine.  Stale recovery is
+    rare, so the small immutable marker is preferable to an unsafe cleanup
+    race or a crashed transient claim that wedges all future writers.
     """
     if not _old_enough_to_reap(path, stale_s):
         return False
     observed = _lease_snapshot(path)
     if observed is None or not _snapshot_is_stale(observed, stale_s):
         return False
-    claim = _reap_claim_path(path, observed[2])
-    try:
-        claim.mkdir()
-    except FileExistsError:
+    tomb = _stale_tomb_path(path, observed)
+    if tomb.exists() or not _mark_stale_lease(path):
         return False
+
+    # Creating the marker changes the directory mtime, so identity and owner
+    # (not age) are the relevant re-check here. The original snapshot was
+    # already age- and liveness-validated immediately above.
+    current = _lease_snapshot(path)
+    if current is None or not _same_snapshot(observed, current):
+        return False
+    try:
+        _rename_lease(path, tomb)
     except OSError:
         return False
-
-    try:
-        current = _lease_snapshot(path)
-        if (
-            current is None
-            or not _same_snapshot(observed, current)
-            or not _snapshot_is_stale(current, stale_s)
-        ):
-            return False
-
-        tomb = path.with_name(f"{path.name}.stale.{os.getpid()}.{uuid.uuid4().hex}")
-        try:
-            _rename_lease(path, tomb)
-        except OSError:
-            return False
-        moved = _lease_snapshot(tomb)
-        if moved is None or not _same_snapshot(current, moved):
-            # Defensive fallback for filesystems with surprising rename
-            # semantics. Do not delete an object whose identity changed.
-            if not path.exists():
-                try:
-                    _rename_lease(tomb, path)
-                except OSError:
-                    pass
-            return False
-        try:
-            shutil.rmtree(tomb)
-        except OSError:
-            # The authoritative name is already free. A unique quarantine
-            # directory is safer than restoring a partly removed stale lock.
-            pass
-        return True
-    finally:
-        try:
-            claim.rmdir()
-        except OSError:
-            pass
+    moved = _lease_snapshot(tomb)
+    if moved is None or not _same_snapshot(current, moved):
+        # Defensive fallback for filesystems with surprising rename
+        # semantics. Do not delete an object whose identity changed.
+        if not path.exists():
+            try:
+                _rename_lease(tomb, path)
+            except OSError:
+                pass
+        return False
+    return True
 
 
 def _lock_number(value: object, default: float, minimum: float) -> float:
@@ -530,7 +534,10 @@ def store_lock(
     """
     directory = guard_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    path = (directory / ".lock.d").resolve()
+    # Resolve only the trusted parent. Resolving the leaf would follow a
+    # hostile/pre-existing `.lock.d` symlink and could make stale recovery
+    # rename a directory outside the store.
+    path = directory.resolve() / ".lock.d"
     key = os.path.normcase(str(path))
     held = _held_leases()
     if key in held:

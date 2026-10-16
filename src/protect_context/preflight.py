@@ -4,59 +4,117 @@ Reduces mid-task discovery of environment problems. No network, no LLM.
 
 from __future__ import annotations
 
+import os
+import signal
 import shutil
 import subprocess
+import tempfile
+import time
 
 from . import store
 
 PREFLIGHT_TOOLS_MAX = 20
 TOOL_NAME_MAX = 120
+PROBE_OUTPUT_MAX_BYTES = 4096
+PROBE_TIMEOUT_S = 2.0
+PREFLIGHT_DEADLINE_S = 15.0
 
 
-def _version(tool: str) -> str | None:
-    """First line of `<tool> --version`, best-effort; None on any failure."""
+def _terminate_probe(process: subprocess.Popen) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
-        r = subprocess.run([tool, "--version"], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    text = (r.stdout + r.stderr).decode("utf-8", errors="replace").strip()
-    if not text:
-        return None
-    first = text.splitlines()[0].strip()
+        process.kill()
+    except OSError:
+        pass
+
+
+def _probe(argv: list[str], timeout_s: float) -> tuple[int | None, str, bool]:
+    """Run a bounded probe without retaining arbitrary child output in RAM."""
+    if timeout_s <= 0:
+        return None, "", True
+    popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                **popen_kwargs,
+            )
+        except OSError:
+            return None, "", False
+        timed_out = False
+        try:
+            process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_probe(process)
+            process.wait()
+        output.seek(0)
+        raw = output.read(PROBE_OUTPUT_MAX_BYTES)
+    text = raw.decode("utf-8", errors="replace")
+    return (None if timed_out else process.returncode), text, timed_out
+
+
+def _version(tool: str, timeout_s: float = PROBE_TIMEOUT_S) -> tuple[str | None, bool]:
+    """Return a compact version line and whether the probe was incomplete."""
+    returncode, text, timed_out = _probe([tool, "--version"], timeout_s)
+    if timed_out or returncode != 0:
+        return None, True
+    first_raw = next((line for line in text.splitlines() if line.strip()), "")
+    first = store.display_text(first_raw, 60)
+    if not first:
+        return None, True
     # normalize "git version 2.43.0" → "2.43.0"
     first = first.replace("version ", "", 1)
-    return first[:60] or None
+    return first or None, False
 
 
-def in_git_repo() -> bool:
-    try:
-        r = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, timeout=10
-        )
-    except (OSError, subprocess.TimeoutExpired):
+def in_git_repo(timeout_s: float = PROBE_TIMEOUT_S) -> bool:
+    git = shutil.which("git")
+    if git is None:
         return False
-    return r.returncode == 0 and r.stdout.decode().strip() == "true"
+    returncode, text, timed_out = _probe(
+        [git, "rev-parse", "--is-inside-work-tree"], timeout_s
+    )
+    return not timed_out and returncode == 0 and text.strip() == "true"
 
 
 def run_preflight(cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else _load_config()
     tools = []
+    probe_issues: list[str] = []
     configured = cfg.get("preflight_tools", [])
     configured = configured if isinstance(configured, list) else []
+    deadline = time.monotonic() + PREFLIGHT_DEADLINE_S
+    git_repo = in_git_repo(min(PROBE_TIMEOUT_S, max(0.0, deadline - time.monotonic())))
     for raw_tool in configured[:PREFLIGHT_TOOLS_MAX]:
         if not isinstance(raw_tool, str):
             continue
         t = store.display_text(raw_tool, TOOL_NAME_MAX)
         if not t:
             continue
-        present = shutil.which(t) is not None
-        tools.append({"tool": t, "present": present, "version": _version(t) if present else None})
+        executable = shutil.which(t)
+        present = executable is not None
+        version = None
+        if executable is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            version, incomplete = _version(executable, min(PROBE_TIMEOUT_S, remaining))
+            if incomplete:
+                probe_issues.append(t)
+        tools.append({"tool": t, "present": present, "version": version})
     missing = [t["tool"] for t in tools if not t["present"]]
     return {
         "tools": tools,
-        "git_repo": in_git_repo(),
+        "git_repo": git_repo,
         "missing": missing,
         "omitted_tools": max(0, len(configured) - PREFLIGHT_TOOLS_MAX),
+        "probe_issues": probe_issues,
     }
 
 
@@ -68,7 +126,16 @@ def render(res: dict) -> str:
     lines = [f"PC preflight · git repo: {'yes' if res['git_repo'] else 'NO'}"]
     present = [t for t in res["tools"] if t["present"]]
     if present:
-        lines.append(" · ".join(f"{t['tool']} {t['version']}".strip() for t in present))
+        lines.append(
+            " · ".join(
+                f"{t['tool']} {t['version'] or '(version unavailable)'}" for t in present
+            )
+        )
+    probe_issues = res.get("probe_issues", [])
+    if probe_issues:
+        visible = probe_issues[:5]
+        suffix = f" (+{len(probe_issues) - len(visible)} more)" if len(probe_issues) > len(visible) else ""
+        lines.append("version probe incomplete: " + ", ".join(visible) + suffix)
     if res["missing"]:
         lines.append("missing: " + ", ".join(res["missing"]))
         if not res["git_repo"]:
@@ -77,11 +144,11 @@ def render(res: dict) -> str:
             )
         else:
             lines.append("Nudge: install the missing tools before debugging code — this is an environment problem.")
-    elif res.get("omitted_tools"):
+    elif res.get("omitted_tools") or probe_issues:
         lines.append("missing: none among checked tools")
         lines.append(
-            "Nudge: preflight is incomplete — reduce the configured tool list "
-            "or check the omitted tools separately."
+            "Nudge: preflight is incomplete — inspect unavailable versions and "
+            "check omitted tools separately."
         )
     else:
         lines.append("missing: none")

@@ -228,17 +228,16 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  /** Count tracked, staged and non-ignored untracked work. `git status`
-   * supplies the untracked set so .gitignore semantics remain Git's own; the
-   * bounded scanner only measures those selected files. An unborn HEAD uses
-   * one empty-tree-to-working-tree numstat instead of silently reporting Δ0
-   * or double-counting staged files edited again. */
+  /** Count tracked, staged and non-ignored work against the session-start
+   * baseline. `git status` supplies the untracked set so .gitignore semantics
+   * remain Git's own; the bounded scanner only measures those selected files.
+   * An unborn/no-repository-at-start session uses one empty-tree-to-working-
+   * tree numstat instead of letting a mid-session commit reset the delta. */
   async function gatherDiff(ctx: ExtensionContext): Promise<DiffSnapshot> {
     const rootOut = await runGit(ctx, ["rev-parse", "--show-toplevel"]);
     if (rootOut === null || rootOut.trim() === "") return unavailableDiff(false, false);
     const root = rootOut.trim();
-    const head = await runGit(ctx, ["rev-parse", "--verify", "HEAD"]);
-    const unborn = head === null;
+    const unborn = session.gitUnborn || session.gitHead === null;
 
     let tracked;
     if (unborn) {
@@ -252,7 +251,9 @@ export default function (pi: ExtensionAPI) {
       if (out === null) return unavailableDiff(true, true);
       tracked = parseNumstat(out);
     } else {
-      const out = await runGit(ctx, ["diff", "--numstat", "HEAD", "--"]);
+      // A named commit compares the complete current working tree (including
+      // commits made after session_start) with the frozen session baseline.
+      const out = await runGit(ctx, ["diff", "--numstat", session.gitHead!, "--"]);
       if (out === null) return unavailableDiff(true, false);
       tracked = parseNumstat(out);
     }
@@ -468,7 +469,7 @@ export default function (pi: ExtensionAPI) {
       // Failure diagnostics (pytest summaries, compiler errors) live at the
       // END of output — and the digest rule is "last ≤2000 chars" — so show
       // the TAIL, not the head, or the only visible preview is spent on banners.
-      const tail = run.digest.slice(-160).replace(/\s+/g, " ").trim();
+      const tail = truncLine(run.digest.slice(-160), 160);
       if (tail) lines.push(`out: ${run.digest.length > 160 ? "…" : ""}${tail}`);
       lines.push(`Nudge: recorded the failure — fix or change approach; do not re-run unchanged.`);
     } else {
@@ -486,20 +487,28 @@ export default function (pi: ExtensionAPI) {
       // files are preserved by loadConfig.
       cfg = loadConfig(ctx.cwd, true).config;
       session.id = safeSessionId(ctx);
-      session.started = new Date().toISOString();
       const repoRoot = await runGit(ctx, ["rev-parse", "--show-toplevel"]);
       const head = await runGit(ctx, ["rev-parse", "--verify", "HEAD"]);
-      session.gitHead = head?.trim() || null;
-      session.gitUnborn = repoRoot !== null && session.gitHead === null;
       loadContract(ctx.cwd); // seeds contract.json from DEFAULT_CONTRACT if missing
 
       const prev = loadState(ctx.cwd);
       if (prev && prev.current_session?.id === session.id && prev.notify_watermarks) {
         state = { ...prev, counters: prev.counters ?? {} };
+        // Extension reloads can fire session_start again for the same pi
+        // session. Preserve the original baseline from state instead of
+        // silently resetting it to a newer commit.
+        session.started = prev.current_session.started || new Date().toISOString();
+        session.gitHead = prev.current_session.git_head;
       } else {
+        session.started = new Date().toISOString();
+        session.gitHead = head?.trim() || null;
         state = defaultState(session.id, session.gitHead);
         saveState(ctx.cwd, state);
       }
+      // A null baseline inside a repository means the session began before a
+      // first commit (or before repository creation). Keep using the empty
+      // tree even if HEAD appears later, so commits cannot erase session diff.
+      session.gitUnborn = repoRoot !== null && session.gitHead === null;
       // Warm the in-memory counters once per session (O(1) hot paths after this).
       rebuildLoopState(ctx.cwd);
       evidenceCount = sessionEvidence(ctx.cwd).count;
@@ -853,11 +862,12 @@ export default function (pi: ExtensionAPI) {
         }
         if (verb === "remove") {
           const removed = rest !== "" && removeConstraint(ctx.cwd, rest);
+          const safeId = truncLine(rest, 80);
           if (ctx.hasUI) {
             ctx.ui.notify(
               removed
-                ? `removed ${rest}\nNudge: the contract re-injects on your next prompt.`
-                : `no constraint '${rest}'\nNudge: run /guard-contract list first.`,
+                ? `removed ${safeId}\nNudge: the contract re-injects on your next prompt.`
+                : `no constraint '${safeId}'\nNudge: run /guard-contract list first.`,
               removed ? "info" : "warning",
             );
           }

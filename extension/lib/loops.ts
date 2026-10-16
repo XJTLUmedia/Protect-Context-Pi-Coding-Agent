@@ -4,6 +4,7 @@
  */
 
 import type { EventRecord } from "./events.ts";
+import { normalizeOneLine } from "./text.ts";
 import { normalizeCommand } from "./fingerprint.ts";
 import type { VerifyRun } from "./verify.ts";
 
@@ -126,8 +127,9 @@ export function shouldBlockLoop(priorFailures: number, loopBlockAfter: number): 
 
 /** FROZEN block reason format (SPEC §5). */
 export function loopBlockReason(cmd: string, priorFailures: number): string {
+  const safeCommand = normalizeOneLine(cmd, 60);
   return (
-    `guard: '${cmd}' already failed ${priorFailures} times this session — do not re-run unchanged; ` +
+    `guard: '${safeCommand}' already failed ${priorFailures} times this session — do not re-run unchanged; ` +
     `change approach or read the error. ` +
     `(Raise loop_block_after in .agent-guard/config.json to override.)`
   );
