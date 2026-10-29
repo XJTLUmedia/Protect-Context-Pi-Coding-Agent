@@ -29,6 +29,8 @@ The suite is **advisory-first**. It records evidence and makes unsafe or
 repetitive behavior visible; it is not a sandbox and does not prove that a
 change is correct. [`SPEC.md`](./SPEC.md) is the frozen v1.0 contract.
 
+![Architecture: the pi extension, MCP server, and Python CLI share a project-local .agent-guard store for rules, journal entries, and evidence; only pi injects briefs automatically](./docs/images/shared-store.svg)
+
 ## Contents
 
 - [Why this exists](#why-this-exists)
@@ -249,6 +251,8 @@ And the always-on one-line widget:
 PC Δ+88L/6f 0loop ev5 ctx8%
 ```
 
+![Illustrative pi widget: Δ+123L/4f means 123 changed lines across 4 files, 1loop means one command at the blocking threshold, ev2 counts two verification runs this session, and ctx41% shows context usage](./docs/images/status-widget.svg)
+
 ## Interface comparison
 
 | Capability | pi extension | MCP server | CLI |
@@ -451,6 +455,8 @@ quoted strings) into a fingerprint, then counts consecutive failures of that
 fingerprint across both bash and `guard_verify`. At `loop_block_after` the
 attempt is refused, with the prior failure count and a change-strategy nudge —
 the single cheapest intervention in the suite.
+
+![Verification workflow: run a command, persist its evidence, and cite the result. With the default threshold, two failures of the same normalized command block its third attempt; only that command succeeding resets its streak](./docs/images/evidence-loop.svg)
 
 ### Scope audit
 

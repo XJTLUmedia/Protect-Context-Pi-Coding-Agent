@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="590" viewBox="0 0 1040 590" role="img" aria-labelledby="title desc">
+  <title id="title">Record evidence, then change strategy when a command keeps failing</title>
+  <desc id="desc">guard_verify runs a command and records its ID, exit code, duration, command, and output digest in verify_runs.jsonl. Cite the evidence for the specific claim it supports. With the default loop_block_after of 3, two failures of the same normalized command cause the third attempt to be blocked. A success of that command resets its streak; a different command's success does not. Evidence is not proof of correctness.</desc>
+  <defs>
+    <style>
+      text { font-family: system-ui, sans-serif; fill: #e6edf3; }
+      .muted { fill: #a9bbcc; font-size: 19px; }
+      .mono { font-family: ui-monospace, 'DejaVu Sans Mono', monospace; font-size: 20px; }
+      .label { fill: #75d5b5; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
+      .card { fill: #121d29; stroke: #34485d; }
+      .arrow { fill: none; stroke: #75d5b5; stroke-width: 2; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 Z" fill="#75d5b5"/></marker>
+  </defs>
+  <rect width="1040" height="590" rx="18" fill="#0b1119"/>
+  <text x="40" y="45" class="label">PROTECT-CONTEXT / EVIDENCE + LOOP BRAKE</text>
+  <text x="40" y="89" font-size="32" font-weight="700">Run. Record. Cite the result.</text>
+  <text x="40" y="122" class="muted">A verification record supports a specific claim, not a blanket “done”.</text>
+
+  <rect x="40" y="158" width="280" height="152" rx="12" class="card"/>
+  <text x="62" y="194" font-size="23" font-weight="700">1 / Verify</text>
+  <text x="62" y="233" class="mono">guard_verify</text>
+  <text x="62" y="267" class="mono">command: pytest -q</text>
+  <path d="M326 234 H364" class="arrow"/>
+  <rect x="370" y="158" width="300" height="152" rx="12" class="card"/>
+  <text x="392" y="194" font-size="23" font-weight="700">2 / Persist evidence</text>
+  <text x="392" y="233" class="mono">verify_runs.jsonl</text>
+  <text x="392" y="267" class="muted">ID, exit, time, cmd, digest</text>
+  <path d="M676 234 H714" class="arrow"/>
+  <rect x="720" y="158" width="280" height="152" rx="12" fill="#10251f" stroke="#4a9e85"/>
+  <text x="742" y="194" font-size="23" font-weight="700">3 / Cite the result</text>
+  <text x="742" y="233" class="mono">ev-NNNN · exit 0</text>
+  <text x="742" y="267" class="muted">Cite what the run checked</text>
+
+  <text x="40" y="359" font-size="23" font-weight="700">Same normalized command, default threshold of 3</text>
+  <rect x="40" y="382" width="280" height="102" rx="12" class="card"/>
+  <text x="62" y="421" font-size="23" font-weight="700" style="fill:#f6c56f">Attempt 1 / failed</text>
+  <text x="62" y="456" class="muted">Record failure + output</text>
+  <path d="M326 433 H364" class="arrow"/>
+  <rect x="370" y="382" width="300" height="102" rx="12" class="card"/>
+  <text x="392" y="421" font-size="23" font-weight="700" style="fill:#f6c56f">Attempt 2 / failed</text>
+  <text x="392" y="456" class="muted">Two failures in the streak</text>
+  <path d="M676 433 H714" class="arrow"/>
+  <rect x="720" y="382" width="280" height="102" rx="12" fill="#301b23" stroke="#ec899d"/>
+  <text x="742" y="421" font-size="22" font-weight="700" style="fill:#ffadbd">Attempt 3 / blocked</text>
+  <text x="742" y="456" class="muted">Read errors; adapt</text>
+
+  <text x="40" y="523" class="muted">Only a success of that same command resets its failure streak.</text>
+  <text x="40" y="550" class="muted">Illustrative flow. Evidence records command outcomes, not correctness.</text>
+  <text x="40" y="577" class="muted">Verification uses your shell privileges. It is not sandboxed.</text>
+</svg>

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="460" viewBox="0 0 1040 460" role="img" aria-labelledby="title desc">
+  <title id="title">Read the pi status widget at a glance</title>
+  <desc id="desc">Illustrative widget: PC delta plus 123 L slash 4 f means 123 changed lines across 4 files; 1loop means one command is at the loop-block threshold; ev2 means two verification runs this session, not evidence ID 2; ctx41% means 41 percent context usage. Diff warnings are advisory, not edit blocks.</desc>
+  <defs>
+    <style>
+      text { font-family: system-ui, sans-serif; fill: #e6edf3; }
+      .muted { fill: #a9bbcc; font-size: 18px; }
+      .label { fill: #75d5b5; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
+      .mono { font-family: ui-monospace, 'DejaVu Sans Mono', monospace; font-size: 28px; }
+      .card { fill: #121d29; stroke: #34485d; }
+    </style>
+  </defs>
+  <rect width="1040" height="460" rx="18" fill="#0b1119"/>
+  <text x="40" y="45" class="label">PROTECT-CONTEXT / WIDGET ANATOMY</text>
+  <text x="40" y="89" font-size="32" font-weight="700">One line. Four signals.</text>
+  <text x="40" y="122" class="muted">Illustrative pi widget — refreshed at turn end.</text>
+
+  <rect x="40" y="152" width="960" height="76" rx="12" class="card"/>
+  <text x="64" y="200" class="mono">PC</text>
+  <text x="150" y="200" class="mono" style="fill:#83c5ff">Δ+123L/4f</text>
+  <text x="416" y="200" class="mono" style="fill:#f6c56f">1loop</text>
+  <text x="660" y="200" class="mono" style="fill:#75d5b5">ev2</text>
+  <text x="830" y="200" class="mono" style="fill:#c4b5fd">ctx41%</text>
+  <path d="M204 216 V256 H152 V272" fill="none" stroke="#83c5ff" stroke-width="2"/>
+  <path d="M458 216 V272" fill="none" stroke="#f6c56f" stroke-width="2"/>
+  <path d="M686 216 V256 H642 V272" fill="none" stroke="#75d5b5" stroke-width="2"/>
+  <path d="M882 216 V272" fill="none" stroke="#c4b5fd" stroke-width="2"/>
+
+  <rect x="40" y="272" width="225" height="112" rx="10" class="card"/>
+  <text x="58" y="304" font-size="21" font-weight="700" style="fill:#83c5ff">Scope</text>
+  <text x="58" y="334" class="muted">123 changed lines</text>
+  <text x="58" y="361" class="muted">across 4 files</text>
+  <rect x="285" y="272" width="225" height="112" rx="10" class="card"/>
+  <text x="303" y="304" font-size="21" font-weight="700" style="fill:#f6c56f">Loops</text>
+  <text x="303" y="334" class="muted">1 command at the</text>
+  <text x="303" y="361" class="muted">blocking threshold</text>
+  <rect x="530" y="272" width="225" height="112" rx="10" class="card"/>
+  <text x="548" y="304" font-size="21" font-weight="700" style="fill:#75d5b5">Evidence count</text>
+  <text x="548" y="334" class="muted">2 runs this session</text>
+  <text x="548" y="361" class="muted">Not an evidence ID</text>
+  <rect x="775" y="272" width="225" height="112" rx="10" class="card"/>
+  <text x="793" y="304" font-size="21" font-weight="700" style="fill:#c4b5fd">Context</text>
+  <text x="793" y="334" class="muted">41% of the context</text>
+  <text x="793" y="361" class="muted">window in use</text>
+
+  <text x="40" y="419" class="muted">Δ? = diff unavailable · Δ≥ = lower bound from a bounded scan</text>
+  <text x="40" y="446" class="muted">Scope warnings are advisory; they do not block edits.</text>
+</svg>

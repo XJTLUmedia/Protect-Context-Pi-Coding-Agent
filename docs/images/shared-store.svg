@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="600" viewBox="0 0 1040 600" role="img" aria-labelledby="title desc">
+  <title id="title">Three interfaces, one project-local store</title>
+  <desc id="desc">The pi extension, Python MCP server, and Python CLI read and write the same .agent-guard directory. It stores configuration, constraints, journal entries, events, verification evidence, and state. Only pi injects the brief automatically. Guardrail logic makes no network or LLM calls; verification commands can.</desc>
+  <defs>
+    <style>
+      text { font-family: system-ui, sans-serif; fill: #e6edf3; }
+      .muted { fill: #a9bbcc; font-size: 19px; }
+      .mono { font-family: ui-monospace, 'DejaVu Sans Mono', monospace; font-size: 20px; }
+      .label { fill: #75d5b5; font-size: 16px; font-weight: 700; letter-spacing: 2px; }
+      .card { fill: #121d29; stroke: #34485d; }
+      .link { fill: none; stroke: #75d5b5; stroke-width: 2; marker-start: url(#arrow); marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 Z" fill="#75d5b5"/></marker>
+  </defs>
+  <rect width="1040" height="600" rx="18" fill="#0b1119"/>
+  <text x="40" y="45" class="label">PROTECT-CONTEXT / ARCHITECTURE</text>
+  <text x="40" y="89" font-size="32" font-weight="700">Three interfaces. One durable store.</text>
+  <text x="40" y="122" class="muted">Choose your host without losing the project's rules, decisions, or evidence.</text>
+
+  <rect x="40" y="158" width="300" height="142" rx="12" class="card"/>
+  <text x="62" y="194" font-size="24" font-weight="700">pi extension</text>
+  <text x="62" y="225" class="muted">TypeScript / auto brief</text>
+  <text x="62" y="260" class="muted">Widget + lifecycle checks</text>
+  <rect x="370" y="158" width="300" height="142" rx="12" class="card"/>
+  <text x="392" y="194" font-size="24" font-weight="700">MCP server</text>
+  <text x="392" y="225" class="muted">Python / portable tools</text>
+  <text x="392" y="260" class="muted">Host approval policy</text>
+  <rect x="700" y="158" width="300" height="142" rx="12" class="card"/>
+  <text x="722" y="194" font-size="24" font-weight="700">Python CLI</text>
+  <text x="722" y="225" class="muted">Terminal / scripts / CI</text>
+  <text x="722" y="260" class="muted">Run commands explicitly</text>
+
+  <path d="M190 310 V356" class="link"/>
+  <path d="M520 310 V356" class="link"/>
+  <path d="M850 310 V356" class="link"/>
+  <rect x="40" y="366" width="960" height="154" rx="12" fill="#10251f" stroke="#4a9e85"/>
+  <text x="64" y="405" class="mono" font-weight="700">.agent-guard/</text>
+  <text x="64" y="440" class="muted">Project-local files shared by both runtimes</text>
+  <text x="64" y="481" class="mono">config.json</text>
+  <text x="372" y="481" class="mono">contract.json</text>
+  <text x="680" y="481" class="mono">journal.jsonl</text>
+  <text x="64" y="507" class="mono">events.jsonl</text>
+  <text x="372" y="507" class="mono">verify_runs.jsonl</text>
+  <text x="680" y="507" class="mono">state.json</text>
+  <text x="40" y="558" class="muted">Guardrail logic: no network or LLM calls. Verification commands can make either.</text>
+  <text x="40" y="583" class="muted">Advisory-first, not a sandbox. Only pi injects the brief automatically.</text>
+</svg>
