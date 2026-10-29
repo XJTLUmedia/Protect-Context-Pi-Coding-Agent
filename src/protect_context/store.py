@@ -31,6 +31,7 @@ try:
 except ImportError:  # pragma: no cover — non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+from . import layers
 from .defaults import DEFAULT_CONFIG
 
 GUARD_DIR = ".agent-guard"
@@ -43,6 +44,13 @@ STORE_LOCK_MIN_STALE_S = 10.0
 STORE_LOCK_STALE_S = 30.0
 STORE_LOCK_TIMEOUT_S = 5.0
 STORE_LOCK_RETRY_S = 0.025
+
+# Ledger bounding (SPEC §2): a ledger rotates to `name.N.jsonl` when it passes
+# this size, keeping at most LEDGER_SEGMENTS rotated files. Readers concatenate
+# oldest-first, so "last N rows" stays correct and the newest evidence id (the
+# basis for `ev-NNNN` allocation) can never be rotated away.
+LEDGER_MAX_BYTES = 1_048_576
+LEDGER_SEGMENTS = 3
 _LEASE_OWNER = "owner.json"
 _LEASE_REAP_MARKER = ".reap-marker"
 _LEASE_RENAME_TIMEOUT_S = 1.0
@@ -54,10 +62,13 @@ EVENT_KINDS = ("tool_call", "tool_result")
 
 DEFAULT_STATE: dict = {
     "current_session": {"id": None, "started": None, "git_head": None},
-    "brief_digest": "",
-    "notify_watermarks": {"ctx_pct": 0, "diff_lines": 0, "diff_files": 0},
+    "sessions": {},
     "counters": {},
 }
+
+# Bounded retention: concurrent sessions keep separate baselines, but the file
+# must not grow forever (pruned on save, newest first).
+SESSION_KEEP = 8
 
 
 def guard_dir() -> Path:
@@ -169,18 +180,21 @@ def read_json(path: Path):
 def _exclusive_flock(lf) -> Iterator[None]:
     """Hold a best-effort exclusive flock on an already-open lock file."""
     locked = False
-    if fcntl is not None:
+    # Bind the optional platform module once: the `is not None` narrowing then
+    # applies to every use, instead of being re-derived per call site.
+    mod = fcntl
+    if mod is not None:
         try:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            mod.flock(lf.fileno(), mod.LOCK_EX)
             locked = True
         except OSError:
             locked = False
     try:
         yield
     finally:
-        if locked:
+        if locked and mod is not None:
             try:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                mod.flock(lf.fileno(), mod.LOCK_UN)
             except OSError:
                 pass
 
@@ -210,7 +224,7 @@ def _windows_pid_is_live(pid: int) -> bool:
     try:
         import ctypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         open_process = kernel32.OpenProcess
         open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
         open_process.restype = ctypes.c_void_p
@@ -229,7 +243,7 @@ def _windows_pid_is_live(pid: int) -> bool:
         if not handle:
             # Access denied is conservatively "possibly live"; Windows uses
             # ERROR_INVALID_PARAMETER for a PID that does not exist.
-            return ctypes.get_last_error() != error_invalid_parameter
+            return ctypes.get_last_error() != error_invalid_parameter  # type: ignore[attr-defined]
         try:
             result = wait_for_single_object(handle, 0)
             if result == wait_object_0:
@@ -523,6 +537,7 @@ def store_lock(
     timeout_s: float = STORE_LOCK_TIMEOUT_S,
     stale_s: float = STORE_LOCK_STALE_S,
     retry_s: float = STORE_LOCK_RETRY_S,
+    directory: Path | None = None,
 ) -> Iterator[None]:
     """Hold the shared cross-runtime store lock.
 
@@ -531,8 +546,11 @@ def store_lock(
     compatibility, but the directory lease is the cross-runtime authority.
     Acquisition either succeeds or raises ``TimeoutError``; it never runs the
     protected code unlocked.
+
+    ``directory`` defaults to this project's store; the personal layer passes
+    its own directory so two projects never share the wrong lease.
     """
-    directory = guard_dir()
+    directory = guard_dir() if directory is None else directory
     directory.mkdir(parents=True, exist_ok=True)
     # Resolve only the trusted parent. Resolving the leaf would follow a
     # hostile/pre-existing `.lock.d` symlink and could make stale recovery
@@ -558,9 +576,48 @@ def store_lock(
         _release_lease(path, token)
 
 
+def ledger_files(path: Path) -> list[Path]:
+    """Existing ledger files for ``path``, OLDEST first: rotated segments
+    (highest index first) and the live file last."""
+    files = []
+    for index in range(LEDGER_SEGMENTS, 0, -1):
+        candidate = path.with_name(f"{path.stem}.{index}{path.suffix}")
+        if candidate.exists():
+            files.append(candidate)
+    if path.exists():
+        files.append(path)
+    return files
+
+
+def _rotate_ledger(path: Path) -> None:
+    """Shift segments down one slot (dropping the oldest) and start a fresh
+    live file. Must run under the store lease: callers hold it via append."""
+    for index in range(LEDGER_SEGMENTS - 1, 0, -1):
+        src = path.with_name(f"{path.stem}.{index}{path.suffix}")
+        if src.exists():
+            src.replace(path.with_name(f"{path.stem}.{index + 1}{path.suffix}"))
+    path.replace(path.with_name(f"{path.stem}.1{path.suffix}"))
+
+
+def _maybe_rotate(path: Path) -> None:
+    try:
+        too_big = path.exists() and path.stat().st_size >= LEDGER_MAX_BYTES
+    except OSError:
+        return
+    if too_big:
+        _rotate_ledger(path)
+
+
 def _append_unlocked(path: Path, entry: dict) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _maybe_rotate(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        # A ledger that cannot be appended is a real failure: surface the path
+        # instead of silently losing the event.
+        raise OSError(f"cannot append to ledger {path}: {exc}") from exc
 
 
 def _open_lock(directory: Path | None = None):
@@ -592,21 +649,28 @@ def locked_append(path: Path, factory: Callable[[], dict]) -> dict:
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    """Read a JSONL file; blank/malformed lines are skipped (best-effort)."""
-    if not path.exists():
-        return []
+    """Read a ledger oldest-row-first across its rotated segments; blank or
+    malformed lines are skipped (best-effort)."""
     out: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            out.append(obj)
+    for segment in ledger_files(path):
+        for line in _read_text_safe(segment).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
     return out
+
+
+def _read_text_safe(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def _valid_config_value(key: str, val: object) -> bool:
@@ -633,28 +697,109 @@ def _valid_config_value(key: str, val: object) -> bool:
 
 
 def load_config() -> dict:
-    """Load config.json merged over DEFAULT_CONFIG (known keys only; corrupt,
-    missing, or wrong-typed values fall back to defaults)."""
+    """Load config merged weakest-first: DEFAULT_CONFIG, then the personal
+    layer (~/.config/protect-context/config.json), then this project's
+    config.json (SPEC §2). Corrupt, missing, or wrong-typed values fall back to
+    the value from the next weaker layer.
+
+    Unknown keys are preserved verbatim (strongest layer wins) instead of being
+    silently dropped, so an owner can park personal knobs — or another tool's
+    settings — in the same file. The guard itself never interprets them.
+    """
     ensure()
     cfg = dict(DEFAULT_CONFIG)
-    data = read_json(config_path())
-    if isinstance(data, dict):
-        for key in DEFAULT_CONFIG:
-            if key in data and _valid_config_value(key, data[key]):
-                cfg[key] = data[key]
+    for path, is_project in ((layers.user_config_path(), False), (config_path(), True)):
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        for key, val in data.items():
+            if key not in DEFAULT_CONFIG:
+                cfg[key] = val
+                continue
+            if not _valid_config_value(key, val):
+                continue
+            # A seeded project file records every default value. Reading those
+            # as explicit choices would shadow the personal layer forever, so a
+            # project value identical to the built-in default means "no
+            # opinion" and the personal layer still applies.
+            if is_project and val == DEFAULT_CONFIG[key]:
+                continue
+            cfg[key] = val
     return cfg
 
 
 def load_state() -> dict:
-    """Load state.json merged over DEFAULT_STATE (deep-copied defaults)."""
+    """Load state.json merged over DEFAULT_STATE (deep-copied defaults).
+
+    Per-session baselines live under ``sessions[<id>]`` so concurrent sessions in
+    one project cannot clobber each other's digest or watermarks (SPEC §2). A
+    legacy top-level ``brief_digest``/``notify_watermarks`` pair is migrated into
+    the current session's entry in memory; the file is only rewritten on save.
+    """
     st = json.loads(json.dumps(DEFAULT_STATE))
     data = read_json(state_path())
-    if isinstance(data, dict):
-        for key, val in data.items():
-            st[key] = val
+    if not isinstance(data, dict):
+        return st
+    legacy = {
+        "brief_digest": data.pop("brief_digest", None),
+        "notify_watermarks": data.pop("notify_watermarks", None),
+    }
+    for key, val in data.items():
+        st[key] = val
+    if not isinstance(st.get("sessions"), dict):
+        st["sessions"] = {}
+    current = st.get("current_session")
+    sid = current.get("id") if isinstance(current, dict) else None
+    if isinstance(sid, str) and sid and sid not in st["sessions"]:
+        migrated = {"started": current.get("started"), "git_head": current.get("git_head")}
+        if isinstance(legacy["brief_digest"], str):
+            migrated["brief_digest"] = legacy["brief_digest"]
+        if isinstance(legacy["notify_watermarks"], dict):
+            migrated["notify_watermarks"] = legacy["notify_watermarks"]
+        if len(migrated) > 2 or legacy["brief_digest"] or legacy["notify_watermarks"]:
+            st["sessions"][sid] = migrated
     return st
 
 
+def session_state(state: dict, session_id: str) -> dict:
+    """Return the live per-session entry of ``state``, creating it if absent."""
+    sessions = state.setdefault("sessions", {})
+    entry = sessions.get(session_id)
+    if not isinstance(entry, dict):
+        entry = {}
+        sessions[session_id] = entry
+    entry.setdefault("started", None)
+    entry.setdefault("git_head", None)
+    entry.setdefault("brief_digest", None)
+    watermarks = entry.get("notify_watermarks")
+    if not isinstance(watermarks, dict):
+        entry["notify_watermarks"] = {"ctx_pct": 0, "diff_lines": 0, "diff_files": 0}
+    return entry
+
+
 def save_state(state: dict) -> None:
+    """Persist state.json, pruning old per-session entries (SESSION_KEEP)."""
     ensure()
+    sessions = state.get("sessions")
+    if isinstance(sessions, dict):
+        current = state.get("current_session")
+        keep_id = current.get("id") if isinstance(current, dict) else None
+        ordered = sorted(
+            sessions.items(),
+            key=lambda kv: str(kv[1].get("updated") or kv[1].get("started") or ""),
+            reverse=True,
+        )
+        # Reserve a slot for the current session so its baseline can never be
+        # pruned away, then fill the rest newest-first.
+        reserve = 1 if isinstance(keep_id, str) and keep_id in sessions else 0
+        kept = {}
+        for sid, entry in ordered:
+            if sid == keep_id:
+                continue
+            if len(kept) >= SESSION_KEEP - reserve:
+                break
+            kept[sid] = entry
+        if reserve:
+            kept[keep_id] = sessions[keep_id]
+        state["sessions"] = kept
     write_json(state_path(), state)

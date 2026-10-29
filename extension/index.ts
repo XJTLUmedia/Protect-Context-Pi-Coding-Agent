@@ -32,11 +32,19 @@ import {
   loadState,
   saveState,
   readJsonl,
+  sessionState,
+  type SessionState,
   storeDir,
   verifyRunsPath,
   withStoreLock,
 } from "./lib/store.ts";
-import { addConstraintWithStatus, contractLines, loadContract, removeConstraint } from "./lib/contract.ts";
+import {
+  addConstraintWithStatus,
+  contractLines,
+  loadContract,
+  personalConstraintCount,
+  removeConstraint,
+} from "./lib/contract.ts";
 import {
   appendJournal,
   isJournalType,
@@ -81,6 +89,14 @@ export default function (pi: ExtensionAPI) {
   let session = { id: "", started: "", gitHead: null as string | null, gitUnborn: false };
   let cfg: GuardConfig = { ...DEFAULT_CONFIG, preflight_tools: [...DEFAULT_CONFIG.preflight_tools] };
   let state = defaultState("", null);
+  // Live view of THIS session's baseline inside `state.sessions`; the scratch
+  // default only covers handlers that fire before session_start.
+  let view: SessionState = {
+    started: "",
+    git_head: null,
+    brief_digest: null,
+    notify_watermarks: { ctx_pct: 0, diff_lines: 0, diff_files: 0 },
+  };
   const startTimes = new Map<string, { start: number; tool: string; cmd: string | null }>();
   let lastDiff = { lines: 0, files: 0, available: false, lowerBound: false };
   let lastCtxPct: number | null = null;
@@ -146,7 +162,7 @@ export default function (pi: ExtensionAPI) {
     return `pc-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  async function runGit(ctx: ExtensionContext, args: string[]): Promise<string | null> {
+  async function runGit(_ctx: ExtensionContext, args: string[]): Promise<string | null> {
     try {
       const res = await pi.exec("git", args, { timeout: 5000 });
       if (res.code !== 0) return null;
@@ -492,19 +508,26 @@ export default function (pi: ExtensionAPI) {
       loadContract(ctx.cwd); // seeds contract.json from DEFAULT_CONTRACT if missing
 
       const prev = loadState(ctx.cwd);
-      if (prev && prev.current_session?.id === session.id && prev.notify_watermarks) {
-        state = { ...prev, counters: prev.counters ?? {} };
+      state = prev ?? defaultState(session.id, null);
+      // A session keeps ITS OWN baseline: a second pi session in the same
+      // project must not reset this one's digest or watermarks (SPEC §2).
+      const returning = prev !== null && prev.sessions[session.id] !== undefined;
+      view = sessionState(state, session.id);
+      if (returning && view.started !== "") {
         // Extension reloads can fire session_start again for the same pi
         // session. Preserve the original baseline from state instead of
         // silently resetting it to a newer commit.
-        session.started = prev.current_session.started || new Date().toISOString();
-        session.gitHead = prev.current_session.git_head;
+        session.started = view.started;
+        session.gitHead = view.git_head;
       } else {
         session.started = new Date().toISOString();
         session.gitHead = head?.trim() || null;
-        state = defaultState(session.id, session.gitHead);
-        saveState(ctx.cwd, state);
+        view.started = session.started;
+        view.git_head = session.gitHead;
+        view.brief_digest = null;
       }
+      state.current_session = { id: session.id, started: session.started, git_head: session.gitHead };
+      saveState(ctx.cwd, state);
       // A null baseline inside a repository means the session began before a
       // first commit (or before repository creation). Keep using the empty
       // tree even if HEAD appears later, so commits cannot erase session diff.
@@ -541,7 +564,7 @@ export default function (pi: ExtensionAPI) {
         lastEvidence: last ? { id: last.id, exit: last.exit, cmd: last.cmd, ms: last.ms } : null,
       });
       const digest = sha1Hex(brief);
-      const briefDue = brief.trim() !== "" && (cfg.brief_mode !== "changed" || state.brief_digest !== digest);
+      const briefDue = brief.trim() !== "" && (cfg.brief_mode !== "changed" || view.brief_digest !== digest);
 
       // Orientation (goal #4): injected once per distinct digest, like the
       // brief. Lazily re-scanned if session_start did not populate it.
@@ -563,7 +586,7 @@ export default function (pi: ExtensionAPI) {
       if (parts.length === 0) return undefined;
 
       if (orientDue && orientDigest !== null) state.counters.orient_sha1 = orientDigest;
-      if (briefDue) state.brief_digest = digest;
+      if (briefDue) view.brief_digest = digest;
       saveState(ctx.cwd, state);
       return { message: { customType: BRIEF_CUSTOM_TYPE, content: parts.join("\n\n"), display: false } };
     }),
@@ -590,6 +613,15 @@ export default function (pi: ExtensionAPI) {
             // block reason as the result) — mark it so the end handler does
             // not record the decline as a failed command.
             blockedToolCallIds.add(event.toolCallId);
+            // Record the refused attempt: otherwise the shared audit trail keeps
+            // no trace of the command the guard refused to run (SPEC §2).
+            withStoreLock(storeDir(ctx.cwd), () => {
+              appendJsonlLocked(
+                eventsPath(ctx.cwd),
+                toolCallEvent(session.id, "bash", { cmd: fp, blocked: true }),
+              );
+              loopLedgerMemo = loopLedgerStamp(ctx.cwd);
+            });
             return { block: true, reason: `guard: risky command declined (${risk})` };
           }
         } else {
@@ -614,9 +646,15 @@ export default function (pi: ExtensionAPI) {
       const blockedFailures = withStoreLock(storeDir(ctx.cwd), () => {
         if (loopLedgerMemo !== loopLedgerStamp(ctx.cwd)) rebuildLoopStateUnlocked(ctx.cwd);
         const failures = loopState.get(fp)?.failures ?? 0;
-        if (shouldBlockLoop(failures, cfg.loop_block_after)) return failures;
-        appendJsonlLocked(eventsPath(ctx.cwd), toolCallEvent(session.id, "bash"));
-        loopLedgerMemo = loopLedgerStamp(ctx.cwd);
+        if (shouldBlockLoop(failures, cfg.loop_block_after)) {
+          appendJsonlLocked(
+            eventsPath(ctx.cwd),
+            toolCallEvent(session.id, "bash", { cmd: fp, blocked: true }),
+          );
+          loopLedgerMemo = loopLedgerStamp(ctx.cwd);
+          return failures;
+        }
+        appendJsonlLocked(eventsPath(ctx.cwd), toolCallEvent(session.id, "bash", { cmd: fp }));
         return null;
       });
       if (blockedFailures !== null) {
@@ -705,10 +743,10 @@ export default function (pi: ExtensionAPI) {
           const step = Math.floor(usage.percent / 10) * 10;
           const contextDue =
             step >= cfg.ctx_warn_pct &&
-            (step > state.notify_watermarks.ctx_pct ||
+            (step > view.notify_watermarks.ctx_pct ||
               (cfg.ctx_warn_pct === 0 && state.counters.ctx_zero_notified !== 1));
           if (contextDue) {
-            state.notify_watermarks.ctx_pct = step;
+            view.notify_watermarks.ctx_pct = step;
             markZeroThreshold(cfg.ctx_warn_pct, "ctx_zero_notified");
             saveState(ctx.cwd, state);
             if (ctx.hasUI) {
@@ -733,7 +771,7 @@ export default function (pi: ExtensionAPI) {
       };
       if (diff.repo && diff.available) {
         const { files, lines } = diff;
-        const wm = state.notify_watermarks;
+        const wm = view.notify_watermarks;
         if (lines >= cfg.diff_hard_lines) {
           if (thresholdDue(lines, cfg.diff_hard_lines, wm.diff_lines, "diff_hard_zero_notified")) {
             wm.diff_lines = Math.max(wm.diff_lines, cfg.diff_hard_lines);
@@ -777,7 +815,7 @@ export default function (pi: ExtensionAPI) {
   // trusted journal entries and orientation even when their text is unchanged.
   pi.on("session_compact", async (_event, ctx) =>
     attempt(ctx, async () => {
-      state.brief_digest = null;
+      view.brief_digest = null;
       delete state.counters.orient_sha1;
       saveState(ctx.cwd, state);
       return undefined;
@@ -820,15 +858,25 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) =>
       attempt(ctx, async () => {
         const trimmed = (args ?? "").trim();
+        // `--global` edits the personal layer (~/.config/protect-context) so one
+        // constraint applies to every project; it is a owner-only surface.
+        const global_requested = /(^|\s)--global(\s|$)/.test(trimmed);
         const parts = trimmed.split(/\s+/);
         const verb = parts[0] ?? "";
-        const rest = parts.slice(1).join(" ").trim();
+        const rest = parts
+          .slice(1)
+          .filter((part) => part !== "--global")
+          .join(" ")
+          .trim();
+        const scope = global_requested ? "user" : "project";
         if (verb === "" || verb === "list") {
           const current = loadContract(ctx.cwd);
           const lines = contractLines(current);
+          const personal = personalConstraintCount();
           if (ctx.hasUI) {
+            const note = personal > 0 ? `\npersonal layer: ${personal} (applies to every project)` : "";
             ctx.ui.notify(
-              `contract (${current.constraints.length}):\n${lines.join("\n")}\nNudge: add missing constraints with /guard-contract add <text>.`,
+              `contract (${current.constraints.length}):\n${lines.join("\n")}${note}\nNudge: add missing constraints with /guard-contract add <text>.`,
               "info",
             );
           }
@@ -836,14 +884,15 @@ export default function (pi: ExtensionAPI) {
         }
         if (verb === "add") {
           if (rest === "") {
-            if (ctx.hasUI) ctx.ui.notify("usage: /guard-contract add <text>", "warning");
+            if (ctx.hasUI) ctx.ui.notify("usage: /guard-contract add <text> [--global]", "warning");
             return undefined;
           }
           // Slash commands are direct owner interaction and therefore trusted
           // by brief prioritization; model-callable writes use provenance tags.
-          const result = addConstraintWithStatus(ctx.cwd, rest, "user");
+          const result = addConstraintWithStatus(ctx.cwd, rest, "user", scope);
           const c = result.constraint;
           const total = result.total;
+          const where = scope === "user" ? " (personal layer — every project)" : "";
           if (ctx.hasUI) {
             // SPEC §5 caps the re-injected brief at 12 contract lines: a
             // constraint past the cap would be silently DROPPED while the
@@ -852,21 +901,29 @@ export default function (pi: ExtensionAPI) {
             const ack = !result.added
               ? `constraint ${c.id} already exists\nNudge: no duplicate was written.`
               : over
-              ? `added ${c.id}\nwarning: ${total} constraints exceed the ${BRIEF_MAX_CONTRACT_LINES}-line brief cap — ` +
+              ? `added ${c.id}${where}\nwarning: ${total} constraints exceed the ${BRIEF_MAX_CONTRACT_LINES}-line brief cap — ` +
                 `only the ${BRIEF_MAX_CONTRACT_LINES} highest-priority owner/seed constraints are re-injected.` +
                 `\nNudge: keep the contract tight — fewer, sharper constraints survive re-injection.`
-              : `added ${c.id}\nNudge: the brief re-injects on your next prompt.`;
+              : `added ${c.id}${where}\nNudge: the brief re-injects on your next prompt.`;
             ctx.ui.notify(ack, result.added && over ? "warning" : "info");
           }
           return undefined;
         }
         if (verb === "remove") {
-          const removed = rest !== "" && removeConstraint(ctx.cwd, rest);
+          const removed = rest !== "" && removeConstraint(ctx.cwd, rest, scope);
           const safeId = truncLine(rest, 80);
+          // A project-scope remove cannot delete personal state: point at it
+          // instead of claiming the id does not exist.
+          const inPersonalLayer =
+            !removed &&
+            scope === "project" &&
+            loadContract(ctx.cwd).constraints.some((constraint) => constraint.id === rest);
           if (ctx.hasUI) {
             ctx.ui.notify(
               removed
                 ? `removed ${safeId}\nNudge: the contract re-injects on your next prompt.`
+                : inPersonalLayer
+                ? `${safeId} lives in the personal layer\nNudge: re-run with /guard-contract remove ${safeId} --global.`
                 : `no constraint '${safeId}'\nNudge: run /guard-contract list first.`,
               removed ? "info" : "warning",
             );

@@ -30,7 +30,6 @@ Principles: advisory-first (nudge before block); block only for repeated identic
 | 12 | Token/API cost & latency | Context usage % watermarks + /compact advice; char budget on tool telemetry; brief injection only-on-change; compact output formats everywhere | ext + core |
 
 ## 2. Shared store: `.agent-guard/` (formats FROZEN)
-
 ```
 .agent-guard/
   config.json         thresholds (below)
@@ -39,17 +38,71 @@ Principles: advisory-first (nudge before block); block only for repeated identic
   events.jsonl        {"ts","session","kind":"tool_call|tool_result","tool","ok":bool|null,
                        "ms":num|null,"out_chars":int|null,"cmd":str|null,"exit":int|null}
   verify_runs.jsonl   {"id":"ev-0001","ts","session","cmd","exit","ok":bool,"digest","ms"}
-  state.json          {"current_session":{"id","started","git_head"},"brief_digest",
-                       "notify_watermarks":{"ctx_pct":0,"diff_lines":0,"diff_files":0},
+  state.json          {"current_session":{"id","started","git_head"},
+                       "sessions":{"<id>":{"started","git_head","brief_digest",
+                                           "notify_watermarks":{"ctx_pct","diff_lines","diff_files"},
+                                           "updated"}},
                        "counters":{}}
 ```
 
-- `cmd` is stored ONLY for bash `tool_result` events, already fingerprint-normalized.
+- `cmd` is stored for bash rows on both sides of a call: the fingerprint-normalized
+  command on `tool_call`, and again on `tool_result` (where `ok`/`exit` are known).
+- A refused bash call (loop block, declined risk confirm) is recorded as a
+  `tool_call` row with `cmd` + `ok=false` and no matching `tool_result`; loop
+  streaks read `tool_result` rows only, so a refusal never counts as a run.
+
+### Personal layer (outside the project store)
+
+Built-in seeds and defaults live in code and are identical for every install.
+Above them, an **optional personal layer** applies to every project on the
+machine, and the project store stays authoritative:
+
+```text
+built-in defaults  <  ~/.config/protect-context/  <  .agent-guard/
+                        contract.json                 contract.json
+                        config.json                   config.json
+```
+
+- Directory: `$PC_USER_DIR`, else `$XDG_CONFIG_HOME/protect-context`, else
+  `~/.config/protect-context`. Only these two files are read; the layer never
+  holds events, evidence, or session state.
+- Precedence: a project row/pair with the same id overrides the personal one.
+  Personal constraints identical in text to a project row are not listed twice.
+- Config: the personal layer is weaker than the project. Because a seeded
+  `config.json` records every default value, a project value **identical to the
+  built-in default means "no opinion"** and the personal value still applies;
+  any different value is an explicit project choice and wins.
+- Owner-only surface: the layer is never seeded or repaired automatically. A
+  missing file means "no personal constraints"; an unreadable one is ignored in
+  memory and left untouched. Agent-callable surfaces (`guard_contract` MCP tool)
+  write the project layer only.
+- Writes: `contract add|remove … --global` (CLI) and `/guard-contract
+  add|remove … --global` (pi) target the personal layer. Each layer is mutated
+  under its own store lease, so two projects never share the wrong lock.
+- Removing a personal id needs `--global`; a project-scope remove reports that
+  the id lives in the personal layer instead of deleting it.
+
+### Store row rules
+
+- `state.json` holds one baseline **per session** under `sessions[<id>]`, so two
+  pi sessions in the same project cannot clobber each other's brief digest or
+  watermark counters; `current_session` names the most recently started one.
+  A v1 flat `brief_digest`/`notify_watermarks` pair is migrated into that
+  session's entry on read (the file is only rewritten on the next save). The
+  file is bounded to the 8 newest sessions (`SESSION_KEEP`), always keeping the
+  current session.
+  current session.
+- **Ledger bounding:** `events.jsonl`, `verify_runs.jsonl` and `journal.jsonl`
+  rotate to `<stem>.1.jsonl` … `<stem>.3.jsonl` once a live file passes 1 MiB
+  (`LEDGER_MAX_BYTES`, `LEDGER_SEGMENTS`), dropping the oldest segment. Readers
+  concatenate oldest-first, so "last N rows" and the maximum `ev-NNNN` id (the
+  basis for allocating the next id) always survive; totals that scan a whole
+  ledger (`budget`, loop streaks) describe the retained window.
 - **Fingerprint normalization:** trim, collapse all whitespace runs to single spaces. Nothing else.
 - **Digest:** last ≤2000 chars of combined stdout+stderr.
 - **Locking:** best-effort `fcntl.flock` on `.agent-guard/.lock` around appends (both implementations).
 - **Session label:** extension uses its session id; Python uses env `PC_SESSION_ID` else `"default"`.
-- `.agent-guard/` is gitignored except nothing — the whole dir is runtime state; defaults live in code on both sides (pinned identical by tests: same 12 constraint ids and texts).
+- `.agent-guard/` is gitignored except nothing — the whole dir is runtime state; defaults live in code on both sides (pinned identical by tests: same 12 constraint ids and texts). Rotated ledger segments (`<stem>.N.jsonl`) are runtime state too and stay ignored.
 
 ### config.json defaults (both sides identical)
 
@@ -99,7 +152,7 @@ Event behaviors (all thresholds from config):
 
 - `session_start`: ensure store; new session id; record git HEAD (null if no repo); load config/contract/journal; render widget.
 - `before_agent_start`: build compact brief (contract ≤12 lines, 3 most-recent corrections, open loops ≤2, last evidence) → if `brief_mode=="changed"` and sha1(brief)==`brief_digest`, skip; else inject `{customType:"guard-brief", content, display:false}` and save digest.
-- `tool_call` (bash only): (a) risk patterns → `ctx.hasUI && risk_confirm` → single `ctx.ui.confirm("Risky command", …)`; no-UI → log only, never block; (b) loop check: prior failed attempts for fingerprint ≥ `loop_block_after - 1` → return `{block:true, reason:"guard: '<cmd>' already failed N times this session — do not re-run unchanged; change approach or read the error. (Raise loop_block_after in .agent-guard/config.json to override.)"}`; (c) else append `tool_call` event.
+- `tool_call` (bash only): (a) risk patterns → `ctx.hasUI && risk_confirm` → single `ctx.ui.confirm("Risky command", …)`; no-UI → log only, never block; a declined confirm appends `tool_call` (`cmd`, `ok=false`); (b) loop check: prior failed attempts for fingerprint ≥ `loop_block_after - 1` → append `tool_call` (`cmd`, `ok=false`) and return `{block:true, reason:"guard: '<cmd>' already failed N times this session — do not re-run unchanged; change approach or read the error. (Raise loop_block_after in .agent-guard/config.json to override.)"}`; (c) else append `tool_call` event with `cmd`.
 - `tool_execution_start`: record start time by toolCallId (map, pruned on end).
 - `tool_execution_end`: append `tool_result` event (`ok=!isError`, ms, out_chars=sum of text content lengths; bash adds cmd fingerprint + exit); update widget.
 - `turn_end`: `ctx.getContextUsage()` → notify once per 10% watermark ≥ `ctx_warn_pct` (suggest /compact); `git diff --shortstat HEAD` → threshold notifies (warn/hard, once per level); update widget.

@@ -10,7 +10,17 @@ from protect_context import store
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PC_SESSION_ID", "test-session")
+    # The personal layer must never be read from the developer's real HOME.
+    monkeypatch.setenv("PC_USER_DIR", str(tmp_path / "user-layer"))
     yield
+
+
+@pytest.fixture
+def user_layer(tmp_path):
+    """Directory used as the personal layer for this test."""
+    d = tmp_path / "user-layer"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @pytest.fixture

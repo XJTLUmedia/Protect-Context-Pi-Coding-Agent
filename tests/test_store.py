@@ -132,20 +132,24 @@ def test_config_load_merge_defaults_and_override():
     cfg = store.load_config()
     assert cfg["loop_block_after"] == 5  # file overrides default
     assert cfg["diff_warn_lines"] == 400  # defaults preserved
-    assert "bogus_key" not in cfg  # unknown keys ignored
+    assert cfg["bogus_key"] == 1  # unknown keys are preserved, never interpreted
 
 
 def test_state_roundtrip():
     st = store.load_state()
     assert st == store.DEFAULT_STATE
-    st["brief_digest"] = "abc123"
+    # Per-session baselines (SPEC §2): the top level holds no digest/watermarks.
+    view = store.session_state(st, "roundtrip")
+    view["brief_digest"] = "abc123"
+    view["notify_watermarks"]["ctx_pct"] = 80
+    st["current_session"] = {"id": "roundtrip", "started": "2026-10-30", "git_head": None}
     st["counters"]["x"] = 1
-    st["notify_watermarks"]["ctx_pct"] = 80
     store.save_state(st)
     loaded = store.load_state()
-    assert loaded["brief_digest"] == "abc123"
+    assert loaded["sessions"]["roundtrip"]["brief_digest"] == "abc123"
     assert loaded["counters"] == {"x": 1}
-    assert loaded["notify_watermarks"]["ctx_pct"] == 80
+    assert loaded["sessions"]["roundtrip"]["notify_watermarks"]["ctx_pct"] == 80
+    assert "brief_digest" not in loaded, "no flat baseline is written any more"
 
 
 def test_fingerprint_trim_and_collapse_only():

@@ -164,6 +164,14 @@ test("index lifecycle: compaction re-injects, provenance holds, bash outcomes an
       ],
     );
 
+    // The attempted command is now on the call row too, so a call that is
+    // refused or never finishes is not anonymous in the audit trail.
+    const cleanCall = await handler(fake, "tool_call")(
+      { toolCallId: "call-1", toolName: "bash", input: { command: "echo ok" } },
+      ctx,
+    );
+    assert.equal(cleanCall, undefined, "an unchanged successful command is not blocked");
+
     const statusTool = fake.tools.get("guard_status");
     const status = await statusTool.execute("s1", {}, null, null, ctx);
     const statusText = status.content[0].text as string;
@@ -197,6 +205,17 @@ test("index lifecycle: compaction re-injects, provenance holds, bash outcomes an
     )) as any;
     assert.equal(blocked.block, true);
     assert.match(blocked.reason, /already failed 2 times/);
+    const calls = readJsonl<EventRecord>(eventsPath(dir)).filter(
+      (event) => event.kind === "tool_call",
+    );
+    assert.deepEqual(
+      calls.map((event) => ({ cmd: event.cmd, ok: event.ok })),
+      [
+        { cmd: "echo ok", ok: null },
+        { cmd: "external failure", ok: false },
+      ],
+      "calls record their command; the refused attempt is kept with ok=false",
+    );
 
     fake.failStatus = true;
     const unavailableStatus = await statusTool.execute("s3", {}, null, null, ctx);

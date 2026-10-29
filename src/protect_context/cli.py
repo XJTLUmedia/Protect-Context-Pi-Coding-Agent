@@ -14,6 +14,7 @@ from . import (
     contract,
     diffscope,
     journal,
+    layers,
     loops,
     orientation,
     preflight,
@@ -33,10 +34,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     store.ensure()
     cons = contract.load()  # seeds contract.json on first use
     st = store.load_state()
+    sid = store.session_id()
+    session_entry = store.session_state(st, sid)
+    if not session_entry.get("started"):
+        session_entry["started"] = store.now_ts()
+    session_entry["git_head"] = diffscope.git_head()
     st["current_session"] = {
-        "id": store.session_id(),
-        "started": store.now_ts(),
-        "git_head": diffscope.git_head(),
+        "id": sid,
+        "started": session_entry["started"],
+        "git_head": session_entry["git_head"],
     }
     store.save_state(st)
     print(f"PC store ready · {store.guard_dir()}")
@@ -87,11 +93,18 @@ def cmd_evidence(args: argparse.Namespace) -> int:
 def cmd_contract(args: argparse.Namespace) -> int:
     if args.action == "list":
         print(contract.render(contract.load()))
+        personal = contract.user_constraint_count()
+        if personal:
+            print(
+                f"personal layer: {personal} from {layers.user_contract_path()}"
+                " (applies to every project; a project row with the same id or text wins)"
+            )
         print("Nudge: honor these constraints; they are re-injected whenever they change.")
         return 0
     if args.action == "add":
+        scope = contract.USER_SCOPE if getattr(args, "global_scope", False) else contract.PROJECT_SCOPE
         try:
-            c, cons = contract.add(args.text)
+            c, cons = contract.add(args.text, scope=scope)
         except contract.ContractIntegrityError as e:
             print(f"contract: {e}")
             print("Nudge: repair or restore the contract file, then retry the mutation.")
@@ -100,11 +113,12 @@ def cmd_contract(args: argparse.Namespace) -> int:
             print(f"contract: {e}")
             print("Nudge: pass a concrete, non-blank constraint.")
             return 2
+        where = "personal layer" if scope == contract.USER_SCOPE else "this project"
         if c is None:
             print(f"contract: identical constraint already present ({len(cons)} total)")
             print("Nudge: reuse the existing constraint instead of duplicating it.")
             return 0
-        print(f"added {c['id']}")
+        print(f"added {c['id']} to {where}")
         print(contract.render(cons))
         warn = contract.brief_cap_warning(len(cons))
         if warn:
@@ -112,8 +126,9 @@ def cmd_contract(args: argparse.Namespace) -> int:
         print("Nudge: keep the contract tight — fewer, sharper constraints survive re-injection.")
         return 0
     if args.action == "remove":
+        scope = contract.USER_SCOPE if getattr(args, "global_scope", False) else contract.PROJECT_SCOPE
         try:
-            removed = contract.remove(args.id)
+            removed = contract.remove(args.id, scope=scope)
         except contract.ContractIntegrityError as e:
             print(f"contract: {e}")
             print("Nudge: repair or restore the contract file, then retry the mutation.")
@@ -124,6 +139,12 @@ def cmd_contract(args: argparse.Namespace) -> int:
             print(contract.render(contract.load()))
             print("Nudge: keep the contract tight — fewer, sharper constraints survive re-injection.")
             return 0
+        if scope == contract.PROJECT_SCOPE and any(
+            c.get("id") == args.id for c in contract.load()
+        ):
+            print(f"{safe_id} lives in the personal layer, not this project")
+            print("Nudge: re-run with --global to remove it from every project.")
+            return 2
         print(f"no constraint with id {safe_id!r}")
         print("Nudge: run 'contract list' to see current ids.")
         return 2
@@ -211,8 +232,20 @@ def build_parser() -> argparse.ArgumentParser:
     csub.add_parser("list")
     a = csub.add_parser("add")
     a.add_argument("text")
+    a.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="add to the personal layer (~/.config/protect-context) instead of this project",
+    )
     r = csub.add_parser("remove")
     r.add_argument("id")
+    r.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="remove from the personal layer instead of this project",
+    )
     sp.set_defaults(func=cmd_contract)
 
     sp = sub.add_parser("note", help="journal entry: decision|correction|risk|note TEXT")

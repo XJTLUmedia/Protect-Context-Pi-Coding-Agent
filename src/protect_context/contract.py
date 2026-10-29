@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from . import store
+from . import layers, store
 from .defaults import DEFAULT_CONTRACT
 
 MAX_SLUG = 40
@@ -55,9 +55,50 @@ def brief_cap_warning(total: int) -> str:
     )
 
 
-def _load_unlocked() -> list[dict]:
-    """Load constraints, seeding contract.json from DEFAULT_CONTRACT if the
-    file is missing. A corrupt file falls back to in-memory defaults."""
+def _row_key(row: dict) -> str:
+    return _normalise_text(row.get("id"), RENDER_ID_MAX)
+
+
+def _row_signature(row: dict) -> str:
+    return _normalise_text(row.get("text"), MAX_TEXT)
+
+
+def _user_rows() -> list[dict]:
+    """Read the personal layer, best-effort.
+
+    The personal layer is owner-only surface: a missing file means "no personal
+    constraints" (never seeded), and an unreadable one is ignored in memory
+    rather than repaired, so a transient error can never rewrite the owner's
+    file.
+    """
+    data = store.read_json(layers.user_contract_path())
+    if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
+        return []
+    return [
+        dict(c)
+        for c in data["constraints"]
+        if isinstance(c, dict)
+        and all(isinstance(c.get(k), str) for k in ("id", "text", "added", "source"))
+    ]
+
+
+def merged(project: list[dict]) -> list[dict]:
+    """Project rows first, then personal rows the project does not already
+    carry (same id or identical text). SPEC §2: the project overrides the
+    personal layer."""
+    return layers.merge_unique(
+        (project, _user_rows()), key=_row_key, signature=_row_signature
+    )
+
+
+def user_constraint_count() -> int:
+    """Constraints the personal layer contributes to the merged view."""
+    return len(_user_rows())
+
+
+def _project_unlocked() -> list[dict]:
+    """Load the project rows, seeding contract.json from DEFAULT_CONTRACT if
+    the file is missing. A corrupt file falls back to in-memory defaults."""
     p = store.contract_path()
     if not p.exists():
         data = [dict(c) for c in DEFAULT_CONTRACT]
@@ -83,6 +124,11 @@ def _load_unlocked() -> list[dict]:
     return valid
 
 
+def _load_unlocked() -> list[dict]:
+    """Effective contract: project rows plus the personal layer (SPEC §2)."""
+    return merged(_project_unlocked())
+
+
 def _load_for_mutation_unlocked() -> list[dict]:
     """Load only a fully valid contract for read-modify-write operations.
 
@@ -92,7 +138,7 @@ def _load_for_mutation_unlocked() -> list[dict]:
     """
     p = store.contract_path()
     if not p.exists():
-        return _load_unlocked()
+        return _project_unlocked()
     data = store.read_json(p)
     if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
         raise ContractIntegrityError(
@@ -143,20 +189,110 @@ def _slug(text: str) -> str:
     return ("-".join(words)[:MAX_SLUG]).strip("-") or "constraint"
 
 
-def add(text: str, source: str = "user") -> tuple[dict | None, list[dict]]:
-    """Add a constraint. Returns (constraint_or_None_if_duplicate, all)."""
+PROJECT_SCOPE = "project"
+USER_SCOPE = "user"
+SCOPES = (PROJECT_SCOPE, USER_SCOPE)
+
+
+def _check_scope(scope: str) -> str:
+    if scope not in SCOPES:
+        raise ValueError(f"unknown contract scope {scope!r}")
+    return scope
+
+
+def _scope_lock(scope: str):
+    """Lease for the layer being written: the project store, or the personal
+    directory (two projects must never share the wrong lease)."""
+    if scope == USER_SCOPE:
+        return store.store_lock(directory=layers.user_dir())
+    return store.store_lock()
+
+
+def _project_rows_readonly() -> list[dict]:
+    """Project rows without seeding or writing, as a basis for personal-layer
+    mutations (never hold the user lease while writing the project store)."""
+    data = store.read_json(store.contract_path())
+    if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
+        return [dict(c) for c in DEFAULT_CONTRACT]
+    rows = [
+        dict(c)
+        for c in data["constraints"]
+        if isinstance(c, dict)
+        and all(isinstance(c.get(k), str) for k in ("id", "text", "added", "source"))
+    ]
+    if data["constraints"] and not rows:
+        return [dict(c) for c in DEFAULT_CONTRACT]
+    return rows
+
+
+def _user_rows_for_mutation() -> list[dict]:
+    """Personal rows for a read-modify-write cycle.
+
+    A missing personal layer is not an error (it is never seeded); a damaged
+    one fails closed so a mutation cannot silently erase owner data.
+    """
+    p = layers.user_contract_path()
+    if not p.exists():
+        return []
+    data = store.read_json(p)
+    if not isinstance(data, dict) or not isinstance(data.get("constraints"), list):
+        raise ContractIntegrityError(
+            f"personal contract is malformed; repair {p} before mutating it"
+        )
+    rows = data["constraints"]
+    if any(
+        not isinstance(row, dict)
+        or not all(isinstance(row.get(k), str) for k in ("id", "text", "added", "source"))
+        for row in rows
+    ):
+        raise ContractIntegrityError(
+            f"personal contract contains malformed rows; repair {p} before mutating it"
+        )
+    return [dict(row) for row in rows]
+
+
+def _scope_rows_for_mutation(scope: str) -> list[dict]:
+    return _user_rows_for_mutation() if scope == USER_SCOPE else _load_for_mutation_unlocked()
+
+
+def _save_scope_unlocked(scope: str, constraints: list[dict]) -> None:
+    if scope == USER_SCOPE:
+        store.write_json(layers.user_contract_path(), {"version": 1, "constraints": constraints})
+        return
+    _save_unlocked(constraints)
+
+
+def _effective_after(scope: str, scope_rows: list[dict]) -> list[dict]:
+    """Effective contract after a write to ``scope``."""
+    if scope == USER_SCOPE:
+        return merged(_project_rows_readonly())
+    return merged(scope_rows)
+
+
+def add(
+    text: str, source: str = "user", scope: str = PROJECT_SCOPE
+) -> tuple[dict | None, list[dict]]:
+    """Add a constraint to ``scope`` (project store or personal layer).
+
+    Returns (constraint_or_None_if_duplicate, effective_contract).
+    """
     text = _normalise_text(text, MAX_TEXT)
     if not text:
         raise ValueError("constraint text must not be blank")
-    with store.store_lock():
-        cons = _load_for_mutation_unlocked()
-        for c in cons:
+    scope = _check_scope(scope)
+    with _scope_lock(scope):
+        cons = _scope_rows_for_mutation(scope)
+        # Dedupe and number against the EFFECTIVE contract so a personal
+        # constraint is never duplicated into the project, and ids never
+        # collide across layers.
+        effective = merged(cons) if scope == PROJECT_SCOPE else merged(_project_rows_readonly())
+        for c in effective:
             if _normalise_text(c.get("text"), MAX_TEXT) == text:
-                return None, cons
-        num = 1 + max([_num(c.get("id", "")) for c in cons] or [0])
+                return None, effective
+        num = 1 + max([_num(c.get("id", "")) for c in effective] or [0])
         base = f"{num:02d}-{_slug(text)}"
         cid = base
-        taken = {c.get("id") for c in cons}
+        taken = {c.get("id") for c in effective}
         n = 2
         while cid in taken:
             cid = f"{base}-{n}"
@@ -168,19 +304,20 @@ def add(text: str, source: str = "user") -> tuple[dict | None, list[dict]]:
             "source": source,
         }
         cons.append(constraint)
-        _save_unlocked(cons)
-        return constraint, cons
+        _save_scope_unlocked(scope, cons)
+        return constraint, _effective_after(scope, cons)
 
 
-def remove(cid: str, *, allow_seed: bool = True) -> bool:
-    """Remove a constraint by exact id. Returns False if not found.
+def remove(cid: str, *, allow_seed: bool = True, scope: str = PROJECT_SCOPE) -> bool:
+    """Remove a constraint from ``scope`` by exact id. False if not found.
 
     ``allow_seed=False`` performs the provenance check inside the same lock as
     the write, so a concurrent replacement cannot bypass an agent surface's
     frozen-seed protection.
     """
-    with store.store_lock():
-        cons = _load_for_mutation_unlocked()
+    scope = _check_scope(scope)
+    with _scope_lock(scope):
+        cons = _scope_rows_for_mutation(scope)
         targets = [c for c in cons if c.get("id") == cid]
         if not targets:
             return False
@@ -189,7 +326,7 @@ def remove(cid: str, *, allow_seed: bool = True) -> bool:
                 "seed constraint removal is refused on agent-driven surfaces"
             )
         kept = [c for c in cons if c.get("id") != cid]
-        _save_unlocked(kept)
+        _save_scope_unlocked(scope, kept)
         return True
 
 

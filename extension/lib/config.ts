@@ -4,7 +4,7 @@
 
 import { existsSync } from "node:fs";
 import { DEFAULT_CONFIG, type GuardConfig } from "./defaults.ts";
-import { configPath, readJson, storeDir, withStoreLock, writeJson } from "./store.ts";
+import { configPath, readJson, storeDir, userConfigPath, withStoreLock, writeJson } from "./store.ts";
 
 function isInteger(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v);
@@ -19,8 +19,11 @@ function strArray(v: unknown): string[] | null {
  * Merge a partial config over the frozen defaults. Unknown keys are ignored;
  * wrong-typed values fall back to the default (deterministic, test-pinned).
  */
-export function mergeConfig(partial: Record<string, unknown> | null | undefined): GuardConfig {
-  const cfg: GuardConfig = { ...DEFAULT_CONFIG, preflight_tools: [...DEFAULT_CONFIG.preflight_tools] };
+export function mergeConfig(
+  partial: Record<string, unknown> | null | undefined,
+  base: GuardConfig = DEFAULT_CONFIG,
+): GuardConfig {
+  const cfg: GuardConfig = { ...base, preflight_tools: [...base.preflight_tools] };
   if (!partial || typeof partial !== "object") return cfg;
 
   const p = partial as Record<string, unknown>;
@@ -38,20 +41,51 @@ export function mergeConfig(partial: Record<string, unknown> | null | undefined)
 
 export interface LoadedConfig {
   config: GuardConfig;
+  /** Unknown keys from the personal/project files, preserved but never
+   * interpreted by the guard (strongest layer wins). Kept out of
+   * `GuardConfig` so a typo in a known key still fails to type-check. */
+  extras: Record<string, unknown>;
   path: string;
   existed: boolean;
 }
 
-/** Load `.agent-guard/config.json` merged over defaults. Missing file →
- * defaults; extension startup can request an on-disk seed so an extension-only
- * install has the documented configuration surface without first running the
- * Python CLI. Existing corrupt files are never overwritten. */
+const KNOWN_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
+
+/** Unknown keys of one layer, for pass-through only. */
+function layerExtras(raw: Record<string, unknown> | null): Record<string, unknown> {
+  if (!raw) return {};
+  return Object.fromEntries(Object.entries(raw).filter(([key]) => !KNOWN_KEYS.has(key)));
+}
+
+/** Project values identical to the built-in default mean "no opinion". A seeded
+ * project file records every default, so reading those as explicit choices
+ * would shadow the personal layer forever. */
+function explicitProjectKeys(raw: Record<string, unknown> | null): Record<string, unknown> | undefined {
+  if (!raw) return undefined;
+  const defaults: Record<string, unknown> = Object.fromEntries(Object.entries(DEFAULT_CONFIG));
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (JSON.stringify(value) === JSON.stringify(defaults[key])) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Load `.agent-guard/config.json` over the personal layer
+ * (`~/.config/protect-context/config.json`) over the defaults (SPEC §2).
+ * Extension startup can request an on-disk seed so an extension-only install
+ * has the documented configuration surface without the Python CLI; the seed is
+ * the built-in defaults, never the merged view. Corrupt files are never
+ * overwritten. */
 function readLoadedConfig(cwd: string): LoadedConfig {
   const path = configPath(cwd);
   const existed = existsSync(path);
-  const raw = readJson<Record<string, unknown>>(path);
-  const config = mergeConfig(raw ?? undefined);
-  return { config, path, existed };
+  const personalRaw = readJson<Record<string, unknown>>(userConfigPath());
+  const projectRaw = readJson<Record<string, unknown>>(path);
+  const personal = mergeConfig(personalRaw ?? undefined);
+  const config = mergeConfig(explicitProjectKeys(projectRaw), personal);
+  const extras = { ...layerExtras(personalRaw), ...layerExtras(projectRaw) };
+  return { config, extras, path, existed };
 }
 
 export function loadConfig(cwd: string, seedMissing = false): LoadedConfig {
@@ -61,7 +95,7 @@ export function loadConfig(cwd: string, seedMissing = false): LoadedConfig {
   // by defaults between an optimistic exists() and writeJson().
   return withStoreLock(storeDir(cwd), () => {
     const loaded = readLoadedConfig(cwd);
-    if (!loaded.existed) writeJson(loaded.path, loaded.config);
+    if (!loaded.existed) writeJson(loaded.path, DEFAULT_CONFIG);
     return loaded;
   });
 }

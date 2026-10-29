@@ -10,10 +10,11 @@ export interface EventRecord {
   session: string;
   kind: EventKind;
   tool: string;
+  /** null on an ordinary tool_call; false when the call was refused. */
   ok: boolean | null;
   ms: number | null;
   out_chars: number | null;
-  /** Only set for bash tool_result events; fingerprint-normalized. */
+  /** bash rows only, fingerprint-normalized (tool_call and tool_result). */
   cmd: string | null;
   exit: number | null;
 }
@@ -22,16 +23,22 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-export function toolCallEvent(session: string, tool: string): EventRecord {
+export function toolCallEvent(
+  session: string,
+  tool: string,
+  opts: { cmd?: string | null; blocked?: boolean } = {},
+): EventRecord {
   return {
     ts: nowIso(),
     session,
     kind: "tool_call",
     tool,
-    ok: null,
+    // A refused call (loop block / declined risk confirm) has no result, so the
+    // attempt is recorded as ok=false; an ordinary call has no outcome yet.
+    ok: opts.blocked ? false : null,
     ms: null,
     out_chars: null,
-    cmd: null,
+    cmd: opts.cmd ?? null,
     exit: null,
   };
 }

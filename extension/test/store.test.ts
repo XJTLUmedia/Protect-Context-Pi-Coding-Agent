@@ -84,14 +84,22 @@ function runChild(
   });
 }
 
-test("events: tool_call event has null measures", () => {
-  const e = toolCallEvent("s1", "bash");
+test("events: tool_call keeps the command but records no outcome", () => {
+  const e = toolCallEvent("s1", "bash", { cmd: "npm test" });
   assert.equal(e.kind, "tool_call");
-  assert.equal(e.ok, null);
+  assert.equal(e.cmd, "npm test", "an attempted call keeps what was run");
+  assert.equal(e.ok, null, "no outcome yet");
   assert.equal(e.ms, null);
   assert.equal(e.out_chars, null);
-  assert.equal(e.cmd, null);
   assert.equal(e.exit, null);
+});
+
+test("events: refused tool_call is ok=false and keeps its command", () => {
+  const e = toolCallEvent("s1", "bash", { cmd: "pytest -q", blocked: true });
+  assert.equal(e.kind, "tool_call");
+  assert.equal(e.ok, false);
+  assert.equal(e.cmd, "pytest -q", "a blocked attempt is never anonymous");
+  assert.equal(e.exit, null, "nothing ran, so there is no exit code");
 });
 
 test("events: bash tool_result carries normalized cmd + exit", () => {

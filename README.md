@@ -318,8 +318,8 @@ protect-context status
 protect-context verify "pytest -q" [--timeout 180]
 protect-context evidence [--limit 5]
 protect-context contract list
-protect-context contract add "Keep the public API stable"
-protect-context contract remove ID
+protect-context contract add "Keep the public API stable" [--global]
+protect-context contract remove ID [--global]
 protect-context note correction "use rg, not grep" --tags search
 protect-context journal [--limit 5] [--type decision]
 protect-context orientation
@@ -354,6 +354,68 @@ fully checked. Version probes have a two-second per-tool timeout, share a
 15-second overall deadline, and decode at most 4 KiB of output; a missing
 version is reported as an incomplete preflight.
 
+### Making it yours: the personal layer
+
+The twelve seeds and the config defaults are the same for everyone, on purpose:
+they are the floor that makes the guardrail comparable across machines. What is
+*yours* goes in a personal layer that every project inherits:
+
+```text
+built-in defaults  <  ~/.config/protect-context/  <  .agent-guard/
+                        contract.json                 contract.json
+                        config.json                   config.json
+```
+
+The directory is `$PC_USER_DIR`, else `$XDG_CONFIG_HOME/protect-context`, else
+`~/.config/protect-context`. Write it from the owner surfaces:
+
+```console
+$ protect-context contract add "Prefer stdlib over new dependencies" --global
+added 13-prefer-stdlib-over-new-dependencies to personal layer
+…
+
+$ protect-context contract list          # every project sees it
+personal layer: 1 from /home/you/.config/protect-context/contract.json (applies to every project; a project row with the same id or text wins)
+```
+
+The same flag works in pi: `/guard-contract add <text> --global` and
+`/guard-contract remove <id> --global`. Without it, writes go to the project
+store as before, and `guard_contract` (the agent-callable tool) never touches
+the personal layer.
+
+Rules that make the layering predictable:
+
+- **The project wins.** A project row with the same id overrides the personal
+  one, and a personal constraint identical in text to a project row is not
+  listed twice. Give a personal override the same id (e.g. `03-stay-in-scope`) to
+  reword a seed for every repo.
+- **Defaults mean "no opinion".** The extension seeds `config.json` with every
+  default value; a project value equal to the built-in default therefore does not
+  pin it, so your personal `ctx_warn_pct` still applies. Any *different* project
+  value is an explicit choice and wins.
+- **Nothing is created behind your back.** The layer is never seeded or repaired:
+  a missing file means "no personal constraints", and an unreadable one is
+  ignored in memory and left untouched. Deleting a personal constraint requires
+  `--global`; a project-scope remove says so instead of silently doing nothing.
+- **Each layer has its own lease.** A `--global` write locks the personal
+  directory, not the project store, so two projects writing personal state cannot
+  race each other.
+
+### Sharing a contract with a team
+
+`.agent-guard/` is runtime state and normally gitignored. If a team wants one
+shared owner contract, track only that file:
+
+```gitignore
+.agent-guard/*
+!.agent-guard/contract.json
+```
+
+Runtime files (events, evidence, journal, session state) stay local, while
+`contract.json` becomes reviewable in pull requests. Personal constraints still
+apply on top — each teammate's personal layer is weaker than the shared project
+row.
+
 The nine catastrophic patterns that trigger the pi confirmation are frozen and
 deliberately narrow, so benign lookalikes stay silent:
 
@@ -366,6 +428,7 @@ deliberately narrow, so benign lookalikes stay silent:
 | Variable | Effect |
 |---|---|
 | `PC_SESSION_ID` | Names the session used for evidence and loop views, so parallel hosts do not share a view |
+| `PC_USER_DIR` | Overrides the personal-layer directory (default `$XDG_CONFIG_HOME/protect-context` or `~/.config/protect-context`) |
 
 ### Runtime store and concurrency
 
@@ -373,6 +436,18 @@ Runtime files stay in the frozen `.agent-guard/` layout and are gitignored:
 
 `config.json` · `contract.json` · `journal.jsonl` · `events.jsonl` ·
 `verify_runs.jsonl` · `state.json`
+
+The optional personal layer lives outside the repository at
+`~/.config/protect-context/` (`contract.json`, `config.json`) and is never
+written implicitly; see *Making it yours* above.
+
+Ledgers bound themselves instead of growing forever: once `events.jsonl`,
+`verify_runs.jsonl` or `journal.jsonl` passes 1 MiB it rotates to
+`<name>.1.jsonl`, keeping at most three rotated segments and dropping the oldest.
+Reads concatenate the segments oldest-first, so recent rows and the highest
+evidence id always survive; `budget` and loop streaks describe the retained
+window. Session baselines are keyed per session inside `state.json`, so parallel
+pi sessions in one repo no longer overwrite each other's watermarks.
 
 Python and TypeScript use the same atomic-directory lease at
 `.agent-guard/.lock.d`, with an owner token, PID/hostname checks, bounded
@@ -422,7 +497,7 @@ machine: there are no network calls and no LLM calls in the guardrail logic.
 |---|---|
 | `session_start` | Seed config if missing, scan orientation, freeze the diff baseline, start the status widget |
 | `before_agent_start` | Build the brief; inject orientation and/or brief as a hidden message when their digests changed |
-| `tool_call` (bash) | Match the nine risky patterns → one grouped confirm; check the loop fingerprint → block at the threshold |
+| `tool_call` (bash) | Match the nine risky patterns → one grouped confirm; check the loop fingerprint → block at the threshold; record the normalized command, with `ok=false` when the call was refused |
 | `tool_execution_start` / `tool_execution_end` | Record bash outcomes and verify results into the shared loop state and evidence ledger |
 | `turn_end` | Refresh the widget: diff stats, open loops, evidence count, context percentage |
 | `session_compact` | Re-inject trusted context so compaction cannot silently erase it |

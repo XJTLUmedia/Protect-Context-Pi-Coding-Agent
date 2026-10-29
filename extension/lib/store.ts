@@ -20,8 +20,8 @@ import {
   realpathSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { hostname, homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 
 export const STORE_DIR_NAME = ".agent-guard";
@@ -34,6 +34,26 @@ export function ensureStore(cwd: string): string {
   const dir = storeDir(cwd);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+export const USER_DIR_ENV = "PC_USER_DIR";
+
+/** Personal layer directory (SPEC §2): PC_USER_DIR, else $XDG_CONFIG_HOME,
+ * else ~/.config, always under `protect-context/`. Read at call time so tests
+ * and dotfiles-managed machines can redirect it. */
+export function userDir(): string {
+  const override = (process.env[USER_DIR_ENV] ?? "").trim();
+  if (override !== "") return override;
+  const xdg = (process.env.XDG_CONFIG_HOME ?? "").trim();
+  return join(xdg !== "" ? xdg : join(homedir(), ".config"), "protect-context");
+}
+
+export function userContractPath(): string {
+  return join(userDir(), "contract.json");
+}
+
+export function userConfigPath(): string {
+  return join(userDir(), "config.json");
 }
 
 export function configPath(cwd: string): string {
@@ -338,6 +358,7 @@ export function withStoreLock<T>(dir: string, fn: () => T, options: StoreLockOpt
 /** Append one JSON record as a single O_APPEND line write. The caller must
  *  already hold the store lock (see withStoreLock). */
 export function appendJsonlLocked(file: string, record: unknown): void {
+  maybeRotateLedger(file);
   appendFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
 }
 
@@ -371,11 +392,50 @@ export function fileStamp(file: string): string | null {
 
 const jsonlCache = new Map<string, { mtimeMs: number; size: number; data: unknown[] }>();
 
-/** Read a JSONL file into object records; missing file → []. Malformed and
- * non-object lines are skipped, matching the Python ledger reader. Results
- * are cached by mtime+size. */
-export function readJsonl<T>(file: string): T[] {
-  if (!existsSync(file)) return [];
+/** Ledger bounding (SPEC §2): a ledger rotates to `<stem>.N.jsonl` once it
+ *  passes LEDGER_MAX_BYTES, keeping at most LEDGER_SEGMENTS rotated files.
+ *  Readers concatenate oldest-first, so "last N rows" stays correct and the
+ *  newest evidence id (the basis for `ev-NNNN`) is never rotated away. */
+export const LEDGER_MAX_BYTES = 1_048_576;
+export const LEDGER_SEGMENTS = 3;
+
+function segmentPath(file: string, index: number): string {
+  const name = basename(file);
+  const dot = name.lastIndexOf(".");
+  const stem = dot === -1 ? name : name.slice(0, dot);
+  const ext = dot === -1 ? "" : name.slice(dot);
+  return join(dirname(file), `${stem}.${index}${ext}`);
+}
+
+/** Existing ledger files for `file`, OLDEST first: rotated segments (highest
+ *  index first) and the live file last. */
+export function ledgerFiles(file: string): string[] {
+  const files: string[] = [];
+  for (let index = LEDGER_SEGMENTS; index >= 1; index -= 1) {
+    const segment = segmentPath(file, index);
+    if (existsSync(segment)) files.push(segment);
+  }
+  if (existsSync(file)) files.push(file);
+  return files;
+}
+
+function maybeRotateLedger(file: string): void {
+  let size: number;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return;
+  }
+  if (size < LEDGER_MAX_BYTES) return;
+  // Caller holds the store lease, so the shift cannot race another writer.
+  for (let index = LEDGER_SEGMENTS - 1; index >= 1; index -= 1) {
+    const src = segmentPath(file, index);
+    if (existsSync(src)) renameSync(src, segmentPath(file, index + 1));
+  }
+  renameSync(file, segmentPath(file, 1));
+}
+
+function readOneJsonl<T>(file: string): T[] {
   const st = statOf(file);
   if (!st) return [];
   const cached = jsonlCache.get(file);
@@ -397,6 +457,15 @@ export function readJsonl<T>(file: string): T[] {
     }
   }
   jsonlCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, data });
+  return data as T[];
+}
+
+/** Read a ledger into object records, oldest row first across rotated
+ *  segments; missing file → []. Malformed and non-object lines are skipped,
+ *  matching the Python ledger reader. Results are cached by mtime+size. */
+export function readJsonl<T>(file: string): T[] {
+  const data: unknown[] = [];
+  for (const segment of ledgerFiles(file)) data.push(...readOneJsonl<unknown>(segment));
   return data as T[];
 }
 
@@ -430,21 +499,78 @@ export function writeJson(file: string, value: unknown): void {
 // ---------------------------------------------------------------------------
 // state.json (SPEC §2)
 
-export interface GuardState {
-  current_session: { id: string; started: string; git_head: string | null };
+export interface SessionState {
+  started: string;
+  git_head: string | null;
   brief_digest: string | null;
   notify_watermarks: { ctx_pct: number; diff_lines: number; diff_files: number };
+  /** ISO timestamp of the last touch, used only to bound the file. */
+  updated?: string;
+}
+
+/** Baseline that belongs to ONE pi session. Concurrent sessions in one project
+ *  keep separate entries so they cannot clobber each other (SPEC §2). */
+export interface GuardState {
+  current_session: { id: string; started: string; git_head: string | null };
+  sessions: Record<string, SessionState>;
   /** Opaque passthrough on the Python side; the extension stores digests here
    *  (e.g. the orientation digest) alongside numeric counters. */
   counters: Record<string, number | string>;
 }
 
+/** How many per-session baselines to retain (newest first, current always). */
+export const SESSION_KEEP = 8;
+
 export function defaultState(sessionId: string, gitHead: string | null): GuardState {
   return {
     current_session: { id: sessionId, started: new Date().toISOString(), git_head: gitHead },
+    sessions: {},
+    counters: {},
+  };
+}
+
+function freshSession(started: string, gitHead: string | null): SessionState {
+  return {
+    started,
+    git_head: gitHead,
     brief_digest: null,
     notify_watermarks: { ctx_pct: 0, diff_lines: 0, diff_files: 0 },
-    counters: {},
+  };
+}
+
+/** Live per-session entry of `state`, created (and touched) when absent. */
+export function sessionState(state: GuardState, sessionId: string): SessionState {
+  const existing = state.sessions[sessionId];
+  const entry = existing ?? freshSession(state.current_session.started || "", state.current_session.git_head ?? null);
+  entry.updated = new Date().toISOString();
+  state.sessions[sessionId] = entry;
+  return entry;
+}
+
+function numberOrZero(candidate: unknown): number {
+  return typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0 ? candidate : 0;
+}
+
+function readWatermarks(raw: unknown): SessionState["notify_watermarks"] {
+  const value =
+    raw !== null && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  return {
+    ctx_pct: numberOrZero(value.ctx_pct),
+    diff_lines: numberOrZero(value.diff_lines),
+    diff_files: numberOrZero(value.diff_files),
+  };
+}
+
+function readSession(raw: unknown): SessionState | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  const gitHead = value.git_head;
+  return {
+    started: typeof value.started === "string" ? value.started : "",
+    git_head: typeof gitHead === "string" || gitHead === null ? gitHead : null,
+    brief_digest: typeof value.brief_digest === "string" ? value.brief_digest : null,
+    notify_watermarks: readWatermarks(value.notify_watermarks),
+    updated: typeof value.updated === "string" ? value.updated : undefined,
   };
 }
 
@@ -458,16 +584,29 @@ export function loadState(cwd: string): GuardState | null {
     !Array.isArray(value.current_session)
       ? (value.current_session as Record<string, unknown>)
       : {};
-  const rawWatermarks =
-    value.notify_watermarks !== null &&
-    typeof value.notify_watermarks === "object" &&
-    !Array.isArray(value.notify_watermarks)
-      ? (value.notify_watermarks as Record<string, unknown>)
-      : {};
-  const numberOrZero = (candidate: unknown): number =>
-    typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0
-      ? candidate
-      : 0;
+  const gitHead = rawSession.git_head;
+  const sessions: Record<string, SessionState> = {};
+  if (value.sessions !== null && typeof value.sessions === "object" && !Array.isArray(value.sessions)) {
+    for (const [id, entry] of Object.entries(value.sessions as Record<string, unknown>)) {
+      const parsed = readSession(entry);
+      if (parsed) sessions[id] = parsed;
+    }
+  }
+  const currentId = typeof rawSession.id === "string" ? rawSession.id : "";
+  // Legacy v1 files kept one digest/watermark pair at the top level; migrate it
+  // into the current session's entry in memory rather than dropping it.
+  if (currentId !== "" && sessions[currentId] === undefined) {
+    const legacyDigest = typeof value.brief_digest === "string" ? value.brief_digest : null;
+    const legacyWatermarks = readWatermarks(value.notify_watermarks);
+    if (legacyDigest !== null || Object.values(legacyWatermarks).some((n) => n > 0)) {
+      sessions[currentId] = {
+        started: typeof rawSession.started === "string" ? rawSession.started : "",
+        git_head: typeof gitHead === "string" || gitHead === null ? gitHead : null,
+        brief_digest: legacyDigest,
+        notify_watermarks: legacyWatermarks,
+      };
+    }
+  }
   const rawCounters =
     value.counters !== null && typeof value.counters === "object" && !Array.isArray(value.counters)
       ? (value.counters as Record<string, unknown>)
@@ -478,23 +617,31 @@ export function loadState(cwd: string): GuardState | null {
       counters[key] = candidate;
     }
   }
-  const gitHead = rawSession.git_head;
   return {
     current_session: {
-      id: typeof rawSession.id === "string" ? rawSession.id : "",
+      id: currentId,
       started: typeof rawSession.started === "string" ? rawSession.started : "",
       git_head: typeof gitHead === "string" || gitHead === null ? gitHead : null,
     },
-    brief_digest: typeof value.brief_digest === "string" ? value.brief_digest : null,
-    notify_watermarks: {
-      ctx_pct: numberOrZero(rawWatermarks.ctx_pct),
-      diff_lines: numberOrZero(rawWatermarks.diff_lines),
-      diff_files: numberOrZero(rawWatermarks.diff_files),
-    },
+    sessions,
     counters,
   };
 }
 
+/** Persist state.json, keeping the file bounded (SESSION_KEEP entries, the
+ *  current session always among them so its baseline is never pruned). */
 export function saveState(cwd: string, state: GuardState): void {
-  writeJson(statePath(cwd), state);
+  const currentId = state.current_session.id;
+  const ordered = Object.entries(state.sessions).sort(([, a], [, b]) =>
+    String(b.updated ?? b.started ?? "").localeCompare(String(a.updated ?? a.started ?? "")),
+  );
+  const reserve = currentId !== "" && state.sessions[currentId] !== undefined ? 1 : 0;
+  const kept: Record<string, SessionState> = {};
+  for (const [id, entry] of ordered) {
+    if (id === currentId) continue;
+    if (Object.keys(kept).length >= SESSION_KEEP - reserve) break;
+    kept[id] = entry;
+  }
+  if (reserve === 1) kept[currentId] = state.sessions[currentId];
+  writeJson(statePath(cwd), { ...state, sessions: kept });
 }
