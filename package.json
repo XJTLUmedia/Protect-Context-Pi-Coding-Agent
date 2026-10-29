@@ -1,15 +1,50 @@
 {
-  "name": "protect-context-workspace",
+  "name": "protect-context",
   "version": "1.0.0",
-  "private": true,
+  "description": "Pi extension that adds agent guardrails: context brief, verification evidence, loop blocking, diff-scope warnings, and a durable journal.",
   "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "guardrails",
+    "agent-safety",
+    "context"
+  ],
+  "homepage": "https://github.com/XJTLUmedia/Protect-Context-Pi-Coding-Agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XJTLUmedia/Protect-Context-Pi-Coding-Agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/XJTLUmedia/Protect-Context-Pi-Coding-Agent/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./extension/index.ts"
+    ],
+    "image": "./preview.png"
+  },
+  "files": [
+    "extension/index.ts",
+    "extension/lib",
+    "preview.png",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test extension/test/*.test.ts",
     "typecheck": "tsc --noEmit -p extension/tsconfig.json",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.84.4",
