@@ -113,6 +113,28 @@ pi install npm:protect-context
 pi -e npm:protect-context
 ```
 
+Install it through pi, not through `npm install`. The extension declares pi's
+host modules (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`,
+`typebox`) as `"*"` peer dependencies, as Pi requires; Pi suppresses peer
+installation for managed npm packages, while a plain `npm install
+protect-context` does not. The second path downloads the whole pi runtime and
+surfaces advisories from that tree, which belong to the host and not to this
+zero-runtime-dependency extension.
+
+Remove any hand-installed copy first — a directory such as
+`~/.pi/agent/extensions/protect-context` or `.pi/extensions/protect-context`,
+or `pi remove npm:protect-context` if that copy came from npm. Two copies
+register the same tool names, and pi drops the second one:
+
+```text
+Error: Failed to load extension "…/.pi/npm/node_modules/protect-context/extension/index.ts":
+Tool "guard_verify" conflicts with /home/you/.pi/agent/extensions/protect-context/index.ts
+```
+
+One error is reported per tool (`guard_verify`, `guard_note`,
+`guard_contract_check`, `guard_status`), so nothing from the npm copy loads
+until the other copy is gone.
+
 Or copy/symlink the checkout into a trusted extension directory:
 
 ```sh

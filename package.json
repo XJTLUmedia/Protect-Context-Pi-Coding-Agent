@@ -1,6 +1,6 @@
 {
   "name": "protect-context",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Pi extension that adds agent guardrails: context brief, verification evidence, loop blocking, diff-scope warnings, and a durable journal.",
   "type": "module",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
+    "pretest": "node --input-type=module -e \"import{existsSync,readdirSync}from'node:fs';const d='extension/test';const ok=existsSync(d)&&readdirSync(d).some(f=>f.endsWith('.test.ts'));if(!ok){console.error('pretest: no extension/test/*.test.ts found here. Tests ship only in the repository checkout, not in the npm tarball.');process.exit(1)}\"",
     "test": "node --experimental-strip-types --test extension/test/*.test.ts",
     "typecheck": "tsc --noEmit -p extension/tsconfig.json",
     "check": "npm run typecheck && npm test",
